@@ -309,13 +309,16 @@ class BladeRFDriver:
         self._tx_thread = threading.Thread(target=self._tx_loop_dual, daemon=True)
         self._tx_thread.start()
 
+    def set_tx_dual_buffer(self, tx_bytes):
+        """Hot-swap the TX dual buffer. Next TX iteration will use the new buffer."""
+        self._tx_dual_bytes = tx_bytes
+
     def _tx_loop_dual(self):
-        """TX loop for dual channel — replays pre-built interleaved buffer."""
+        """TX loop for dual channel — replays current interleaved buffer."""
         try:
-            tx_bytes = self._tx_dual_bytes
             n_samples = self._tx_dual_n_samples
             while not self._tx_stop.is_set():
-                self.device.sync_tx(tx_bytes, n_samples)
+                self.device.sync_tx(self._tx_dual_bytes, n_samples)
         except Exception as e:
             print(f"[bladerf] TX dual error: {e}")
         finally:

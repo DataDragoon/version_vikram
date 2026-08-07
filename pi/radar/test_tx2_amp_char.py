@@ -1,0 +1,306 @@
+"""Characterize max TX2 digital amplitude per frequency step.
+
+Uses TX gain = 44 dB, RX gain = 25 dB, TX1 amp = 1.0.
+Measures RX2 peak at each frequency with a test TX2 amplitude,
+then calculates the max TX2 amplitude that keeps RX2 peak below 0.9.
+
+Saves a JSON lookup table to be used alongside the TX1 LUT.
+"""
+
+import json
+import time
+import threading
+import numpy as np
+import bladerf
+from bladerf._bladerf import ChannelLayout, Format, ffi, libbladeRF
+
+SCALE = 2047
+MGC = libbladeRF.BLADERF_GAIN_MGC
+TUNING_MODE_FPGA = libbladeRF.BLADERF_TUNING_MODE_FPGA
+
+START_FREQ = 1_000_000_000
+STOP_FREQ = 6_000_000_000
+STEP_SIZE = 10_000_000
+SAMPLE_RATE = 2_000_000
+BANDWIDTH = 1_500_000
+CW_OFFSET = 100_000
+BUF_SAMPLES = 1024
+
+TX_GAIN = 44
+RX_GAIN = 25
+TX1_AMP = 1.0
+
+# Test TX2 amplitude — use 0.1 as measurement reference
+TEST_TX2_AMP = 0.1
+
+# Target: RX2 peak should not exceed this
+TARGET_RX2_PEAK = 0.9
+
+NUM_SETTLE_BUFFERS = 2
+NUM_CAPTURE_BUFFERS = 4
+
+
+def run_characterization():
+    print("=" * 70)
+    print("TX2 AMPLITUDE vs FREQUENCY CHARACTERIZATION")
+    print(f"Sweep: {START_FREQ/1e9:.1f} - {STOP_FREQ/1e9:.1f} GHz, step {STEP_SIZE/1e6:.0f} MHz")
+    print(f"TX gain: {TX_GAIN} dB, RX gain: {RX_GAIN} dB, TX1 amp: {TX1_AMP}")
+    print(f"Test TX2 amplitude: {TEST_TX2_AMP}")
+    print(f"Target RX2 peak: {TARGET_RX2_PEAK}")
+    print("=" * 70)
+
+    device = bladerf.BladeRF()
+    dev_ptr = device.dev[0]
+    print(f"[OK] bladeRF opened: {device.get_serial()}")
+
+    num_steps = int((STOP_FREQ - START_FREQ) / STEP_SIZE) + 1
+    freqs = np.linspace(START_FREQ, STOP_FREQ, num_steps).astype(np.int64)
+    print(f"[OK] {num_steps} frequency steps")
+
+    # Reference tone for downconversion
+    t = np.arange(BUF_SAMPLES, dtype=np.float64) / SAMPLE_RATE
+    ref_tone = np.exp(-1j * 2 * np.pi * CW_OFFSET * t)
+
+    # RX capture state
+    rx_lock = threading.Lock()
+    rx_latest = [None, None]
+    rx_seq = [0]
+
+    # Configure channels
+    for ch_idx in range(2):
+        tx_ch = bladerf.CHANNEL_TX(ch_idx)
+        rx_ch = bladerf.CHANNEL_RX(ch_idx)
+        libbladeRF.bladerf_set_frequency(dev_ptr, tx_ch, int(START_FREQ))
+        libbladeRF.bladerf_set_sample_rate(dev_ptr, tx_ch, SAMPLE_RATE, ffi.NULL)
+        libbladeRF.bladerf_set_bandwidth(dev_ptr, tx_ch, BANDWIDTH, ffi.NULL)
+        libbladeRF.bladerf_set_frequency(dev_ptr, rx_ch, int(START_FREQ))
+        libbladeRF.bladerf_set_sample_rate(dev_ptr, rx_ch, SAMPLE_RATE, ffi.NULL)
+        libbladeRF.bladerf_set_bandwidth(dev_ptr, rx_ch, BANDWIDTH, ffi.NULL)
+        libbladeRF.bladerf_set_gain_mode(dev_ptr, rx_ch, MGC)
+        libbladeRF.bladerf_set_gain(dev_ptr, rx_ch, RX_GAIN)
+        libbladeRF.bladerf_set_gain(dev_ptr, tx_ch, TX_GAIN)
+
+    libbladeRF.bladerf_set_tuning_mode(dev_ptr, TUNING_MODE_FPGA)
+
+    # Generate TX buffer: TX1 at TX1_AMP, TX2 at TEST_TX2_AMP
+    n_samples = int(SAMPLE_RATE * 0.01)
+    t_buf = np.arange(n_samples, dtype=np.float64) / SAMPLE_RATE
+    phase = 2 * np.pi * CW_OFFSET * t_buf
+    tx1_i = np.clip(np.cos(phase) * TX1_AMP * SCALE, -2048, 2047).astype(np.int16)
+    tx1_q = np.clip(np.sin(phase) * TX1_AMP * SCALE, -2048, 2047).astype(np.int16)
+    tx2_i = np.clip(np.cos(phase) * TEST_TX2_AMP * SCALE, -2048, 2047).astype(np.int16)
+    tx2_q = np.clip(np.sin(phase) * TEST_TX2_AMP * SCALE, -2048, 2047).astype(np.int16)
+
+    tx_buf = np.empty(n_samples * 4, dtype=np.int16)
+    tx_buf[0::4] = tx1_i
+    tx_buf[1::4] = tx1_q
+    tx_buf[2::4] = tx2_i
+    tx_buf[3::4] = tx2_q
+    tx_bytes = tx_buf.tobytes()
+
+    # Start TX
+    device.sync_config(
+        layout=ChannelLayout.TX_X2,
+        fmt=Format.SC16_Q11,
+        num_buffers=16,
+        buffer_size=4096,
+        num_transfers=8,
+        stream_timeout=3500
+    )
+    device.enable_module(bladerf.CHANNEL_TX(0), True)
+    device.enable_module(bladerf.CHANNEL_TX(1), True)
+
+    tx_stop = threading.Event()
+
+    def tx_loop():
+        try:
+            while not tx_stop.is_set():
+                device.sync_tx(tx_bytes, n_samples)
+        except Exception as e:
+            print(f"  TX error: {e}")
+
+    tx_thread = threading.Thread(target=tx_loop, daemon=True)
+    tx_thread.start()
+
+    # Start RX
+    device.sync_config(
+        layout=ChannelLayout.RX_X2,
+        fmt=Format.SC16_Q11,
+        num_buffers=16,
+        buffer_size=4096,
+        num_transfers=8,
+        stream_timeout=3500
+    )
+    device.enable_module(bladerf.CHANNEL_RX(0), True)
+    device.enable_module(bladerf.CHANNEL_RX(1), True)
+
+    rx_stop = threading.Event()
+
+    def rx_loop():
+        buf = bytearray(BUF_SAMPLES * 2 * 2 * 2)
+        try:
+            while not rx_stop.is_set():
+                device.sync_rx(buf, BUF_SAMPLES)
+                iq = np.frombuffer(buf, dtype=np.int16).copy()
+                rx1 = np.empty(BUF_SAMPLES * 2, dtype=np.int16)
+                rx2 = np.empty(BUF_SAMPLES * 2, dtype=np.int16)
+                rx1[0::2] = iq[0::4]
+                rx1[1::2] = iq[1::4]
+                rx2[0::2] = iq[2::4]
+                rx2[1::2] = iq[3::4]
+                with rx_lock:
+                    rx_latest[0] = rx1
+                    rx_latest[1] = rx2
+                    rx_seq[0] += 1
+        except Exception as e:
+            print(f"  RX error: {e}")
+
+    rx_thread = threading.Thread(target=rx_loop, daemon=True)
+    rx_thread.start()
+
+    # Re-apply gains after enable_module
+    time.sleep(0.05)
+    for ch_idx in range(2):
+        libbladeRF.bladerf_set_gain_mode(dev_ptr, bladerf.CHANNEL_RX(ch_idx), MGC)
+        libbladeRF.bladerf_set_gain(dev_ptr, bladerf.CHANNEL_RX(ch_idx), RX_GAIN)
+        libbladeRF.bladerf_set_gain(dev_ptr, bladerf.CHANNEL_TX(ch_idx), TX_GAIN)
+
+    time.sleep(0.1)
+
+    # Sweep and measure RX2 peaks
+    rx2_peaks = np.zeros(num_steps)
+    rx2_mags = np.zeros(num_steps)
+
+    tx_ch0 = bladerf.CHANNEL_TX(0)
+    rx_ch0 = bladerf.CHANNEL_RX(0)
+
+    print(f"\nSweeping {num_steps} steps...")
+    for i in range(num_steps):
+        f = int(freqs[i])
+        libbladeRF.bladerf_set_frequency(dev_ptr, tx_ch0, f)
+        libbladeRF.bladerf_set_frequency(dev_ptr, rx_ch0, f)
+
+        # Settle
+        with rx_lock:
+            seq_before = rx_seq[0]
+        target = seq_before + NUM_SETTLE_BUFFERS
+        deadline = time.monotonic() + 1.0
+        while True:
+            with rx_lock:
+                if rx_seq[0] >= target:
+                    break
+            if time.monotonic() > deadline:
+                break
+            time.sleep(0.0002)
+
+        # Capture
+        peak_max = 0.0
+        ref_accum = 0j
+        with rx_lock:
+            last = rx_seq[0]
+
+        for _ in range(NUM_CAPTURE_BUFFERS):
+            deadline = time.monotonic() + 1.0
+            while True:
+                with rx_lock:
+                    if rx_seq[0] > last:
+                        rx2 = rx_latest[1]
+                        last = rx_seq[0]
+                        break
+                if time.monotonic() > deadline:
+                    rx2 = None
+                    break
+                time.sleep(0.0002)
+
+            if rx2 is None:
+                continue
+
+            rx2_abs = np.abs(rx2.astype(np.float64)) / 2047.0
+            step_peak = np.max(rx2_abs)
+            if step_peak > peak_max:
+                peak_max = step_peak
+
+            i2 = rx2[0::2].astype(np.float64) / 2047.0
+            q2 = rx2[1::2].astype(np.float64) / 2047.0
+            ref_accum += np.mean((i2 + 1j * q2) * ref_tone)
+
+        rx2_peaks[i] = peak_max
+        rx2_mags[i] = np.abs(ref_accum / NUM_CAPTURE_BUFFERS)
+
+        if i % 50 == 0:
+            print(f"  Step {i}/{num_steps} ({freqs[i]/1e9:.2f} GHz) — "
+                  f"RX2 peak: {peak_max:.4f}, RX2 mag: {rx2_mags[i]:.4f}")
+
+    # Stop TX/RX
+    tx_stop.set()
+    rx_stop.set()
+    tx_thread.join(timeout=2)
+    rx_thread.join(timeout=2)
+    try:
+        device.enable_module(bladerf.CHANNEL_TX(0), False)
+        device.enable_module(bladerf.CHANNEL_TX(1), False)
+        device.enable_module(bladerf.CHANNEL_RX(0), False)
+        device.enable_module(bladerf.CHANNEL_RX(1), False)
+    except:
+        pass
+    device.close()
+    print("\n[OK] Device closed.")
+
+    # Calculate max TX2 amplitude per frequency
+    # max_tx2_amp = target_peak * test_amp / measured_peak, capped at 1.0
+    max_tx2_amp = np.zeros(num_steps)
+    for i in range(num_steps):
+        if rx2_peaks[i] > 0.001:
+            max_tx2_amp[i] = min(1.0, TARGET_RX2_PEAK * TEST_TX2_AMP / rx2_peaks[i])
+        else:
+            max_tx2_amp[i] = 1.0
+
+    # Build lookup table
+    lookup = {
+        'metadata': {
+            'tx_gain_db': TX_GAIN,
+            'rx_gain_db': RX_GAIN,
+            'tx1_amplitude': TX1_AMP,
+            'test_tx2_amplitude': TEST_TX2_AMP,
+            'target_rx2_peak': TARGET_RX2_PEAK,
+            'start_freq_hz': int(START_FREQ),
+            'stop_freq_hz': int(STOP_FREQ),
+            'step_size_hz': int(STEP_SIZE),
+            'num_steps': num_steps,
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+        },
+        'freq_hz': [int(f) for f in freqs],
+        'max_tx2_amplitude': [round(float(a), 4) for a in max_tx2_amp],
+        'measured_rx2_peak': [round(float(p), 4) for p in rx2_peaks],
+        'measured_rx2_mag': [round(float(m), 4) for m in rx2_mags],
+    }
+
+    out_path = '/home/sfr/version0/pi/radar/tx2_amp_lut.json'
+    with open(out_path, 'w') as f:
+        json.dump(lookup, f, indent=2)
+    print(f"\n[SAVED] {out_path}")
+
+    # Print summary
+    print(f"\n{'='*70}")
+    print("RESULTS SUMMARY")
+    print(f"{'='*70}")
+    print(f"{'Freq (GHz)':<12} {'RX2 Peak':<12} {'Max TX2 Amp':<14} {'RX2 Mag':<12}")
+    print("-" * 50)
+    for i in range(0, num_steps, 50):
+        print(f"{freqs[i]/1e9:<12.2f} {rx2_peaks[i]:<12.4f} {max_tx2_amp[i]:<14.4f} {rx2_mags[i]:<12.4f}")
+    i = num_steps - 1
+    print(f"{freqs[i]/1e9:<12.2f} {rx2_peaks[i]:<12.4f} {max_tx2_amp[i]:<14.4f} {rx2_mags[i]:<12.4f}")
+
+    print(f"\nTX2 amplitude range: {np.min(max_tx2_amp):.4f} - {np.max(max_tx2_amp):.4f}")
+    print(f"Steps at max (1.0): {np.sum(max_tx2_amp >= 1.0)}/{num_steps}")
+    print(f"Steps needing reduction: {np.sum(max_tx2_amp < 1.0)}/{num_steps}")
+
+    # Projected RX2 magnitude with optimized TX2 amplitude
+    projected_rx2_mag = rx2_mags * (max_tx2_amp / TEST_TX2_AMP)
+    print(f"\nProjected RX2 mag range with optimized TX2 amp: {np.min(projected_rx2_mag):.4f} - {np.max(projected_rx2_mag):.4f}")
+    low_ref = np.sum(projected_rx2_mag < 0.001)
+    print(f"Steps with projected RX2 < 0.001: {low_ref}/{num_steps}")
+
+
+if __name__ == '__main__':
+    run_characterization()

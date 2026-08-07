@@ -8,13 +8,18 @@ phase reference (short cable loopback). Dividing signal by reference
 eliminates random PLL phase offsets between TX and RX synthesizers.
 """
 
+import json
+import os
 import threading
 import time
 import numpy as np
 
 from bladerf_driver import BladeRFDriver
-from bladerf._bladerf import libbladeRF
+from bladerf._bladerf import ChannelLayout, Format, libbladeRF
 import bladerf
+
+LUT_PATH = os.path.join(os.path.dirname(__file__), 'tx1_amp_lut.json')
+TX2_LUT_PATH = os.path.join(os.path.dirname(__file__), 'tx2_amp_lut.json')
 
 SPEED_OF_LIGHT = 299_792_458
 
@@ -27,10 +32,10 @@ class SFCWEngine:
         self.step_size = 20_000_000
         self.settle_time = 0.003
         self.num_buffers = 4
-        self.tx1_gain = 30
-        self.rx1_gain = 30
-        self.tx2_gain = 30
-        self.rx2_gain = 20
+        self.tx1_gain = 44
+        self.rx1_gain = 25
+        self.tx2_gain = 44
+        self.rx2_gain = 25
         self.rx_gain_min = 5
         self.rx_gain_max = 38
         self.range_offset = 0.5
@@ -49,6 +54,73 @@ class SFCWEngine:
         self._gains_dirty = False
         self._warm = False
         self._sweep_lock = threading.Lock()
+        self._tx1_amp_lut = None
+        self._tx1_amp_lut_freqs = None
+        self._tx2_amp_lut = None
+        self._tx2_amp_lut_freqs = None
+        self._load_tx1_amp_lut()
+        self._load_tx2_amp_lut()
+
+    def _load_tx1_amp_lut(self):
+        """Load per-frequency TX1 amplitude lookup table."""
+        if not os.path.exists(LUT_PATH):
+            print("[sfcw] No TX1 amplitude LUT found — using flat amplitude")
+            return
+        try:
+            with open(LUT_PATH) as f:
+                data = json.load(f)
+            self._tx1_amp_lut_freqs = np.array(data['freq_hz'], dtype=np.float64)
+            self._tx1_amp_lut = np.array(data['max_tx1_amplitude'], dtype=np.float64)
+            print(f"[sfcw] TX1 amplitude LUT loaded: {len(self._tx1_amp_lut)} entries, "
+                  f"range {self._tx1_amp_lut.min():.3f} - {self._tx1_amp_lut.max():.3f}")
+        except Exception as e:
+            print(f"[sfcw] Failed to load TX1 amplitude LUT: {e}")
+
+    def _load_tx2_amp_lut(self):
+        """Load per-frequency TX2 amplitude lookup table."""
+        if not os.path.exists(TX2_LUT_PATH):
+            print("[sfcw] No TX2 amplitude LUT found — using flat TX2 amplitude")
+            return
+        try:
+            with open(TX2_LUT_PATH) as f:
+                data = json.load(f)
+            self._tx2_amp_lut_freqs = np.array(data['freq_hz'], dtype=np.float64)
+            self._tx2_amp_lut = np.array(data['max_tx2_amplitude'], dtype=np.float64)
+            print(f"[sfcw] TX2 amplitude LUT loaded: {len(self._tx2_amp_lut)} entries, "
+                  f"range {self._tx2_amp_lut.min():.3f} - {self._tx2_amp_lut.max():.3f}")
+        except Exception as e:
+            print(f"[sfcw] Failed to load TX2 amplitude LUT: {e}")
+
+    def _get_tx1_amplitude(self, freq_hz):
+        """Interpolate the LUT to get max TX1 amplitude for a given frequency."""
+        if self._tx1_amp_lut is None:
+            return self.driver.tx_amplitude
+        return float(np.interp(freq_hz, self._tx1_amp_lut_freqs, self._tx1_amp_lut))
+
+    def _get_tx2_amplitude(self, freq_hz):
+        """Interpolate the TX2 LUT to get max TX2 amplitude for a given frequency."""
+        if self._tx2_amp_lut is None:
+            return self._tx2_amp
+        return float(np.interp(freq_hz, self._tx2_amp_lut_freqs, self._tx2_amp_lut))
+
+    def _build_tx_dual_buffer(self, tx1_amp, tx2_amp):
+        """Build an interleaved dual-channel TX buffer with separate amplitudes."""
+        n_samples = int(self.driver.sample_rate * 0.01)
+        t = np.arange(n_samples, dtype=np.float64) / self.driver.sample_rate
+        phase = 2 * np.pi * self.driver.cw_offset * t
+        SCALE = 2047
+
+        tx1_i = np.clip(np.cos(phase) * tx1_amp * SCALE, -2048, 2047).astype(np.int16)
+        tx1_q = np.clip(np.sin(phase) * tx1_amp * SCALE, -2048, 2047).astype(np.int16)
+        tx2_i = np.clip(np.cos(phase) * tx2_amp * SCALE, -2048, 2047).astype(np.int16)
+        tx2_q = np.clip(np.sin(phase) * tx2_amp * SCALE, -2048, 2047).astype(np.int16)
+
+        buf = np.empty(n_samples * 4, dtype=np.int16)
+        buf[0::4] = tx1_i
+        buf[1::4] = tx1_q
+        buf[2::4] = tx2_i
+        buf[3::4] = tx2_q
+        return buf.tobytes()
 
     @property
     def num_steps(self):
@@ -350,7 +422,10 @@ class SFCWEngine:
         self.driver.rx2_gain = self.rx2_gain
         self.driver.sample_rate = 2_000_000
         self.driver.bandwidth = 1_500_000
-        self.driver.set_waveform('cw', offset=100_000, amplitude=0.9)
+        # TX1/TX2 amplitude will be set per-step from LUTs; set initial values
+        initial_tx1_amp = self._get_tx1_amplitude(self.start_freq)
+        self.driver.set_waveform('cw', offset=100_000, amplitude=initial_tx1_amp)
+        self._tx2_amp = 0.05
         self.driver._configure_channels_dual()
         self.driver.set_tuning_mode_fpga()
         self._fpga_tuning = True
@@ -362,7 +437,31 @@ class SFCWEngine:
         n = 1024
         t = np.arange(n, dtype=np.float64) / self.driver.sample_rate
         self._ref_tone = np.exp(-1j * 2 * np.pi * self.driver.cw_offset * t)
-        self.driver.start_tx_dual()
+        # Pre-build initial TX buffer with separate TX1/TX2 amplitudes
+        if self._tx1_amp_lut is not None:
+            initial_tx1_amp = self._get_tx1_amplitude(self.start_freq)
+            initial_buf = self._build_tx_dual_buffer(initial_tx1_amp, self._tx2_amp)
+            self.driver._tx_buffer = self.driver._generate(int(self.driver.sample_rate * 0.01))
+            self.driver._tx_dual_bytes = initial_buf
+            self.driver._tx_dual_n_samples = int(self.driver.sample_rate * 0.01)
+            # Manually start TX dual without rebuilding the buffer
+            self.driver._tx_stop.clear()
+            self.driver.tx_running = True
+            self.driver._dual_channel = True
+            self.driver.device.sync_config(
+                layout=ChannelLayout.TX_X2,
+                fmt=Format.SC16_Q11,
+                num_buffers=16,
+                buffer_size=4096,
+                num_transfers=8,
+                stream_timeout=3500
+            )
+            self.driver.device.enable_module(bladerf.CHANNEL_TX(0), True)
+            self.driver.device.enable_module(bladerf.CHANNEL_TX(1), True)
+            self.driver._tx_thread = threading.Thread(target=self.driver._tx_loop_dual, daemon=True)
+            self.driver._tx_thread.start()
+        else:
+            self.driver.start_tx_dual()
         self.driver.start_rx_dual(self._rx_capture, num_samples=n)
         time.sleep(0.05)
 
@@ -414,9 +513,15 @@ class SFCWEngine:
         rx_ch = bladerf.CHANNEL_RX(0)
         rx_ch1 = bladerf.CHANNEL_RX(1)
 
-        # RX gain held constant during sweep — per-step gain changes introduce
-        # non-deterministic phase offsets between RX1/RX2 that break coherence.
-        # Frequency-dependent power rolloff is compensated in post-processing instead.
+        # Pre-compute per-step TX buffers with both TX1 and TX2 amplitudes from LUTs
+        tx_buffers = None
+        tx1_amplitudes = None
+        tx2_amplitudes = None
+        if self._tx1_amp_lut is not None or self._tx2_amp_lut is not None:
+            tx1_amplitudes = np.array([self._get_tx1_amplitude(f) for f in freqs])
+            tx2_amplitudes = np.array([self._get_tx2_amplitude(f) for f in freqs])
+            tx_buffers = [self._build_tx_dual_buffer(tx1_amplitudes[i], tx2_amplitudes[i])
+                          for i in range(num_steps)]
 
         dropped_steps = 0
 
@@ -425,6 +530,10 @@ class SFCWEngine:
                 return None
 
             f = int(freqs[i])
+
+            # Update TX buffer for this step (per-step TX1 + TX2 amplitudes)
+            if tx_buffers is not None:
+                self.driver.set_tx_dual_buffer(tx_buffers[i])
 
             libbladeRF.bladerf_set_frequency(dev_ptr, tx_ch, f)
             libbladeRF.bladerf_set_frequency(dev_ptr, rx_ch, f)
@@ -494,6 +603,17 @@ class SFCWEngine:
         if dropped_steps > 0:
             print(f"[sfcw] WARNING: {dropped_steps}/{num_steps} steps had incomplete captures")
 
+        # Normalize out per-step digital amplitude variations before calibration
+        # h_signal ∝ TX1_amp, h_reference ∝ TX2_amp
+        if tx1_amplitudes is not None:
+            for i in range(num_steps):
+                if tx1_amplitudes[i] > 0.001:
+                    h_signal[i] /= tx1_amplitudes[i]
+        if tx2_amplitudes is not None:
+            for i in range(num_steps):
+                if tx2_amplitudes[i] > 0.001:
+                    h_reference[i] /= tx2_amplitudes[i]
+
         # Phase-reference division: cancels TX and RX PLL phase offsets
         ref_mag = np.abs(h_reference)
         valid = ref_mag > 1e-10
@@ -527,6 +647,16 @@ class SFCWEngine:
         tx_ch = bladerf.CHANNEL_TX(0)
         rx_ch = bladerf.CHANNEL_RX(0)
 
+        # Pre-compute per-step TX buffers with both TX1 and TX2 amplitudes from LUTs
+        tx_buffers = None
+        tx1_amplitudes = None
+        tx2_amplitudes = None
+        if self._tx1_amp_lut is not None or self._tx2_amp_lut is not None:
+            tx1_amplitudes = np.array([self._get_tx1_amplitude(f) for f in freqs])
+            tx2_amplitudes = np.array([self._get_tx2_amplitude(f) for f in freqs])
+            tx_buffers = [self._build_tx_dual_buffer(tx1_amplitudes[i], tx2_amplitudes[i])
+                          for i in range(num_steps)]
+
         dropped_steps = 0
 
         for i in range(num_steps):
@@ -534,6 +664,9 @@ class SFCWEngine:
                 return None
 
             f = int(freqs[i])
+
+            if tx_buffers is not None:
+                self.driver.set_tx_dual_buffer(tx_buffers[i])
 
             libbladeRF.bladerf_set_frequency(dev_ptr, tx_ch, f)
             libbladeRF.bladerf_set_frequency(dev_ptr, rx_ch, f)
@@ -587,6 +720,16 @@ class SFCWEngine:
 
             h_signal[i] = sig_accum / max(captured, 1)
             h_reference[i] = ref_accum / max(captured, 1)
+
+        # Normalize out per-step digital amplitude variations
+        if tx1_amplitudes is not None:
+            for i in range(num_steps):
+                if tx1_amplitudes[i] > 0.001:
+                    h_signal[i] /= tx1_amplitudes[i]
+        if tx2_amplitudes is not None:
+            for i in range(num_steps):
+                if tx2_amplitudes[i] > 0.001:
+                    h_reference[i] /= tx2_amplitudes[i]
 
         ref_mag = np.abs(h_reference)
         valid = ref_mag > 1e-10
