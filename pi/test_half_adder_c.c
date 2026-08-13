@@ -8,21 +8,22 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <libbladeRF.h>
+#include <bladeRF1.h>  /* For expansion GPIO functions */
 
 void set_inputs(struct bladerf *dev, int a, int b) {
     uint32_t val = (b << 1) | a;  // bit 0 = A, bit 1 = B
-    int status = bladerf_config_gpio_write(dev, val);
+    int status = bladerf_expansion_gpio_write(dev, val);
     if (status != 0) {
-        fprintf(stderr, "Failed to write GPIO: %s\n", bladerf_strerror(status));
+        fprintf(stderr, "Failed to write expansion GPIO: %s\n", bladerf_strerror(status));
     }
     usleep(1000);  // 1ms delay
 }
 
 void read_outputs(struct bladerf *dev, int *sum, int *cout) {
     uint32_t val;
-    int status = bladerf_config_gpio_read(dev, &val);
+    int status = bladerf_expansion_gpio_read(dev, &val);
     if (status != 0) {
-        fprintf(stderr, "Failed to read GPIO: %s\n", bladerf_strerror(status));
+        fprintf(stderr, "Failed to read expansion GPIO: %s\n", bladerf_strerror(status));
         *sum = -1;
         *cout = -1;
         return;

@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <libbladeRF.h>
+#include <bladeRF1.h>  /* For expansion GPIO functions */
 
 void print_gpio_bits(uint32_t val) {
     printf("GPIO Value: 0x%08X = 0b", val);
@@ -73,7 +74,7 @@ int main(int argc, char *argv[]) {
         }
         else if (cmd[0] == 'r' || cmd[0] == 'R') {
             uint32_t val;
-            status = bladerf_config_gpio_read(dev, &val);
+            status = bladerf_expansion_gpio_read(dev, &val);
             if (status != 0) {
                 fprintf(stderr, "Failed to read GPIO: %s\n", bladerf_strerror(status));
             } else {
@@ -84,7 +85,7 @@ int main(int argc, char *argv[]) {
             uint32_t val;
             if (sscanf(cmd + 1, "%x", &val) == 1) {
                 printf("Writing 0x%08X to GPIO...\n", val);
-                status = bladerf_config_gpio_write(dev, val);
+                status = bladerf_expansion_gpio_write(dev, val);
                 if (status != 0) {
                     fprintf(stderr, "Failed to write GPIO: %s\n", bladerf_strerror(status));
                 } else {
@@ -93,7 +94,7 @@ int main(int argc, char *argv[]) {
 
                     // Read back
                     uint32_t read_val;
-                    status = bladerf_config_gpio_read(dev, &read_val);
+                    status = bladerf_expansion_gpio_read(dev, &read_val);
                     if (status == 0) {
                         printf("\nRead back:\n");
                         print_gpio_bits(read_val);
@@ -109,7 +110,7 @@ int main(int argc, char *argv[]) {
                 uint32_t write_val = (b << 1) | a;
                 printf("Testing A=%d, B=%d (writing 0x%X)...\n", a, b, write_val);
 
-                status = bladerf_config_gpio_write(dev, write_val);
+                status = bladerf_expansion_gpio_write(dev, write_val);
                 if (status != 0) {
                     fprintf(stderr, "Failed to write GPIO: %s\n", bladerf_strerror(status));
                     continue;
@@ -118,7 +119,7 @@ int main(int argc, char *argv[]) {
                 usleep(10000);  // 10ms delay
 
                 uint32_t read_val;
-                status = bladerf_config_gpio_read(dev, &read_val);
+                status = bladerf_expansion_gpio_read(dev, &read_val);
                 if (status != 0) {
                     fprintf(stderr, "Failed to read GPIO: %s\n", bladerf_strerror(status));
                     continue;
