@@ -25,9 +25,10 @@
    - `bladerf-hosted.qip` - Added Verilog file references
    - `bladerf-hosted.vhd` - Integrated half-adder into FPGA architecture
 
-3. **Created Python test infrastructure:**
-   - `test_half_adder_fpga.py` - Automated test script (tests all 4 combinations)
-   - `manual_half_adder_test.py` - Interactive test script
+3. **Created C test programs:**
+   - `test_half_adder_c.c` - Automated test (tests all 4 combinations)
+   - `test_gpio_interactive.c` - Interactive GPIO tester for debugging
+   - Note: Python bladeRF bindings don't expose GPIO - must use C API
 
 4. **Documentation:**
    - This QUICKSTART guide
@@ -763,10 +764,13 @@ cd ~/version_vikram
 git pull
 ```
 
-#### ☐ 3.2 Run test
+#### ☐ 3.2 Compile and run test
 ```bash
-# Use the correct file for your FPGA size (A9 in our case)
-python3 pi/test_half_adder_fpga.py --fpga fpga/custom_images/half_adder_bladerf_a9.rbf
+# Compile the C test program
+gcc pi/test_half_adder_c.c -o test_half_adder -lbladeRF
+
+# Run automated test
+./test_half_adder fpga/custom_images/half_adder_bladerf_a9.rbf
 ```
 
 #### ☐ 3.3 Verify output
@@ -777,6 +781,21 @@ A=0, B=1 -> SUM=1, COUT=0 ✓ PASS
 A=1, B=0 -> SUM=1, COUT=0 ✓ PASS
 A=1, B=1 -> SUM=0, COUT=1 ✓ PASS
 ✓ All tests PASSED!
+```
+
+#### ☐ 3.4 Interactive testing (for debugging)
+```bash
+# Compile interactive tester
+gcc pi/test_gpio_interactive.c -o test_gpio_interactive -lbladeRF
+
+# Run interactive mode
+./test_gpio_interactive fpga/custom_images/half_adder_bladerf_a9.rbf
+
+# Commands:
+#   r          - Read GPIO state
+#   w 0x3      - Write GPIO value
+#   t 1 1      - Test A=1, B=1
+#   q          - Quit
 ```
 
 ---
