@@ -4,10 +4,12 @@
 
 **Goal:** Integrate a simple half-adder circuit into bladeRF FPGA, accessible via GPIO from Raspberry Pi
 
-**Status:** ⚠️ **IN PROGRESS** - Code modifications complete, awaiting proper Quartus version for build
+**Status:** ✅ **COMPLETE** - FPGA image built and ready for testing
 
 **Date Started:** August 13, 2026  
-**Repository:** https://github.com/DataDragoon/version_vikram
+**Date Completed:** August 13, 2026 (same day!)  
+**Repository:** https://github.com/DataDragoon/version_vikram  
+**Final Image:** `fpga/custom_images/half_adder_bladerf_a9.rbf` (13 MB)
 
 ---
 
@@ -31,17 +33,51 @@
    - This QUICKSTART guide
    - README_HALF_ADDER.md with detailed technical information
 
-### ⏳ Pending Tasks:
+5. **Built FPGA image successfully:**
+   - Generated 13 MB .rbf file for bladeRF2 A9 FPGA
+   - Includes NIOS II firmware with memory initialization files
+   - Ready for deployment on Raspberry Pi
 
-1. **Build FPGA image** - Requires Quartus Prime 20.1.1 (not 25.1)
-2. **Test on Raspberry Pi** - Once .rbf file is generated
-3. **Verify GPIO communication** - Confirm data flow works end-to-end
+### ⏳ Next Steps:
+
+1. **Test on Raspberry Pi** - Load FPGA image and run test scripts
+2. **Verify GPIO communication** - Confirm half-adder works end-to-end
 
 ---
 
 ## 🔥 Critical Lessons Learned
 
-### 1. **Quartus Version MUST Be 20.1.1**
+### 1. **FPGA SIZE MISMATCH - The Silent Killer**
+
+**THE MOST CRITICAL ISSUE:** We built for A4 (49 KLE) but the device is A9 (301 KLE)!
+
+**How to check your device:**
+```bash
+# On Raspberry Pi with bladeRF connected:
+bladeRF-cli -e "info"
+```
+
+Look for `FPGA size:` line:
+- **49 KLE** → A4 size → Build with `-s A4`
+- **115 KLE** → A5 size → Build with `-s A5`
+- **301 KLE** → A9 size → Build with `-s A9` ← **OUR DEVICE**
+
+**Expected .rbf sizes:**
+- A4: ~2.6 MB
+- A5: ~4.2 MB  
+- A9: ~12-13 MB
+
+**Error when using wrong size:**
+```
+[WARNING] Detected potentially incorrect FPGA file (length was 2632660, expected 12858972).
+[ERROR] bladerf2_load_fpga: fpga file invalid: incorrect file size
+```
+
+**Solution:** Always check your device FPGA size FIRST, then build for that specific size!
+
+---
+
+### 2. **Quartus Version MUST Be 20.1.1**
 
 **Problem:** We initially tried with Quartus 25.1, which **doesn't support NIOS II processor**.
 
@@ -57,7 +93,30 @@ Error: add_instance nios2 altera_nios2_gen2 : No module type named altera_nios2_
 
 ---
 
-### 2. **Wrong Build Directory Initially**
+### 2. **BSP Makefile Path Issue**
+
+**Problem:** NIOS BSP Makefile uses `$(shell pwd)` which returns MSYS paths (`/c/Users/...`) that Windows-native make.exe can't handle.
+
+**Error:**
+```
+make: *** No rule to make target `/c/Users/.../system.h', needed by `all'.  Stop.
+```
+
+**Solution:** Edit the BSP Makefile and replace:
+```makefile
+ABS_BSP_ROOT := $(shell pwd)
+```
+
+With absolute Windows path:
+```makefile
+ABS_BSP_ROOT := C:/Users/USERNAME/bladeRF/hdl/quartus/work/bladerf-micro-A9-hosted/bladeRF_nios_bsp
+```
+
+**Why this happens:** Git Bash uses MSYS path translation, but Intel's Windows-native make.exe doesn't understand it.
+
+---
+
+### 4. **Wrong Build Directory Initially**
 
 **Problem:** We tried building from `hdl/fpga/platforms/bladerf-micro/build/` (wrong!)
 
@@ -67,7 +126,7 @@ Error: add_instance nios2 altera_nios2_gen2 : No module type named altera_nios2_
 
 ---
 
-### 3. **VHDL Component Declaration Location Matters**
+### 5. **VHDL Component Declaration Location Matters**
 
 **Problem:** First placed component declaration after `begin` statement → syntax error
 
@@ -514,34 +573,87 @@ end generate;
 
 ---
 
-**Step 4: Generate NIOS System and BSP**
+**Step 4: Check Your Device FPGA Size (CRITICAL!)**
+
+```bash
+# On Raspberry Pi with bladeRF connected:
+bladeRF-cli -e "info"
+```
+
+Look for `FPGA size:` line:
+- 49 KLE → Use `-s A4` in build commands
+- 115 KLE → Use `-s A5` in build commands
+- 301 KLE → Use `-s A9` in build commands (our device!)
+
+---
+
+**Step 5: Start the Build**
 
 ```bash
 cd /c/Users/1109h/bladeRF/hdl/quartus
 
-# This generates NIOS system, PLLs, and BSP
-./build_bladerf.sh -b bladeRF-micro -s A4 -r hosted
+# Fix line endings in build script
+sed -i 's/\r$//' build_bladerf.sh
+
+# Build for YOUR FPGA size (A9 in our case)
+./build_bladerf.sh -b bladeRF-micro -s A9 -r hosted
 ```
 
-**Expected:** This will run until it hits the `make` error in NIOS software compilation. **That's OK** - we're skipping NIOS software since the half-adder doesn't need it.
+**Expected:** Build will start generating NIOS system, BSP, then hit `make` error. **That's OK!** We'll fix it next.
 
 ---
 
-**Step 5: Compile FPGA Directly**
+**Step 6: Fix BSP Makefile and Build NIOS Software**
 
-Skip the NIOS software and compile just the FPGA:
+The BSP Makefile has MSYS path issues. Fix it manually:
 
 ```bash
-cd /c/Users/1109h/bladeRF/hdl/quartus/work/bladerf-micro-A4-hosted
+cd /c/Users/1109h/bladeRF/hdl/quartus/work/bladerf-micro-A9-hosted/bladeRF_nios_bsp
+
+# Edit Makefile - find line ~65:
+# Change: ABS_BSP_ROOT := $(shell pwd)
+# To:     ABS_BSP_ROOT := C:/Users/1109h/bladeRF/hdl/quartus/work/bladerf-micro-A9-hosted/bladeRF_nios_bsp
+
+# Or use sed:
+sed -i 's|ABS_BSP_ROOT := $(shell pwd)|ABS_BSP_ROOT := C:/Users/1109h/bladeRF/hdl/quartus/work/bladerf-micro-A9-hosted/bladeRF_nios_bsp|' Makefile
+
+# Build BSP
+make
+```
+
+**Expected:** BSP compiles successfully.
+
+---
+
+**Step 7: Generate Memory Initialization Files**
+
+```bash
+cd /c/Users/1109h/bladeRF/hdl/fpga/platforms/bladerf-micro/software/bladeRF_nios
+
+# Generate mem_init files (CRITICAL for correct .rbf size!)
+make WORKDIR=work/bladerf-micro-A9-hosted mem_init_generate
+
+# Verify mem_init files were created
+ls -lh /c/Users/1109h/bladeRF/hdl/quartus/work/bladerf-micro-A9-hosted/bladeRF_nios/mem_init/
+```
+
+**Expected:** Should see `meminit.qip`, `meminit.spd`, and `.hex` files.
+
+---
+
+**Step 8: Compile FPGA**
+
+```bash
+cd /c/Users/1109h/bladeRF/hdl/quartus/work/bladerf-micro-A9-hosted
 
 # Generate Quartus project
 quartus_sh --64bit \
            -t /c/Users/1109h/bladeRF/hdl/fpga/platforms/bladerf-micro/build/bladerf.tcl \
            -projname bladerf \
-           -part 5CEBA4F23C8 \
+           -part 5CEBA9F23C8 \
            -platdir /c/Users/1109h/bladeRF/hdl/fpga/platforms/bladerf-micro
 
-# Compile FPGA (takes 20-30 minutes)
+# Compile FPGA (takes 30-40 minutes for A9)
 quartus_sh --64bit \
            -t /c/Users/1109h/bladeRF/hdl/quartus/build.tcl \
            -projname bladerf \
@@ -552,29 +664,56 @@ quartus_sh --64bit \
            -seed 1
 ```
 
-**Watch for:** "Quartus Prime Shell was successful"
+**Watch for:** "Quartus Prime Shell was successful. 0 errors"
 
 ---
 
-**Step 6: Find and Copy the .rbf File**
+**Step 9: Verify and Copy the .rbf File**
 
 ```bash
-# Find the .rbf
-ls -lh /c/Users/1109h/bladeRF/hdl/quartus/work/bladerf-micro-A4-hosted/output_files/hosted.rbf
+# Check file size (MUST be ~12-13 MB for A9, not 2.6 MB!)
+ls -lh /c/Users/1109h/bladeRF/hdl/quartus/work/bladerf-micro-A9-hosted/output_files/hosted.rbf
 
-# Should show ~2-3 MB (if smaller, build failed)
-
-# Copy to your project
-cp /c/Users/1109h/bladeRF/hdl/quartus/work/bladerf-micro-A4-hosted/output_files/hosted.rbf \
-   /c/Users/1109h/version_vikram/fpga/custom_images/half_adder_bladerf.rbf
+# Copy to your project (update paths for your username and FPGA size)
+cp /c/Users/1109h/bladeRF/hdl/quartus/work/bladerf-micro-A9-hosted/output_files/hosted.rbf \
+   /c/Users/1109h/version_vikram/fpga/custom_images/half_adder_bladerf_a9.rbf
 
 # Verify
-ls -lh /c/Users/1109h/version_vikram/fpga/custom_images/half_adder_bladerf.rbf
+ls -lh /c/Users/1109h/version_vikram/fpga/custom_images/half_adder_bladerf_a9.rbf
 ```
 
 **Expected output:**
 ```
--rw-r--r-- 1 user group 2.6M Aug 13 17:18 half_adder_bladerf.rbf
+-rw-r--r-- 1 user group 13M Aug 13 19:30 half_adder_bladerf_a9.rbf
+```
+
+**❌ If file is 2.6 MB:** mem_init files are missing! Go back to Step 7.  
+**✅ If file is 12-13 MB:** SUCCESS! Proceed to push to GitHub.
+
+---
+
+**Step 10: Push to GitHub**
+
+```bash
+cd /c/Users/1109h/version_vikram
+
+# Add the FPGA image and updated docs
+git add fpga/custom_images/half_adder_bladerf_a9.rbf
+git add fpga/QUICKSTART.md
+
+# Commit
+git commit -m "Add working A9 FPGA image with half-adder (13MB)
+
+- Built for bladeRF2 A9 (301 KLE)
+- Includes NIOS mem_init files
+- Half-adder on GPIO[3:2] (outputs) from GPIO[1:0] (inputs)
+- Fixed BSP Makefile path issues
+- Updated documentation with complete build process
+
+Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"
+
+# Push to GitHub
+git push github sfcw-default-range-offset
 ```
 
 ---
@@ -598,21 +737,18 @@ ls -lh /c/Users/1109h/version_vikram/fpga/custom_images/half_adder_bladerf.rbf
 - **Solution:** Delete `work/` directory and rebuild from scratch
 
 **Build stops at "make: No rule to make target system.h"**
-- **Problem:** NIOS software build failure (path issues)
-- **Solution:** Skip NIOS software, compile FPGA directly (Step 5 above)
+- **Problem:** BSP Makefile has MSYS paths that Windows make can't understand
+- **Solution:** Edit BSP Makefile and hardcode ABS_BSP_ROOT with Windows path (Step 6 above)
+
+**Error: "Detected potentially incorrect FPGA file (length was 2632660, expected 12858972)"**
+- **Problem:** Built for wrong FPGA size (A4 instead of A9)
+- **Solution:** Check your device with `bladeRF-cli -e "info"` and rebuild for correct size
 
 ---
 
 ### ☐ PART 2: Deploy to Git (PC)
 
-```bash
-cd C:\Users\1109h\version_vikram
-git add fpga/custom_images/half_adder_bladerf.rbf
-git add pi/test_half_adder_fpga.py
-git add fpga/*.md
-git commit -m "Add half-adder FPGA integration"
-git push github sfcw-default-range-offset
-```
+See **Step 10** above for complete git commands.
 
 **Note:** Repository is at https://github.com/DataDragoon/version_vikram
 
@@ -629,7 +765,8 @@ git pull
 
 #### ☐ 3.2 Run test
 ```bash
-python3 pi/test_half_adder_fpga.py --fpga fpga/custom_images/half_adder_bladerf.rbf
+# Use the correct file for your FPGA size (A9 in our case)
+python3 pi/test_half_adder_fpga.py --fpga fpga/custom_images/half_adder_bladerf_a9.rbf
 ```
 
 #### ☐ 3.3 Verify output
