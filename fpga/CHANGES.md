@@ -104,7 +104,33 @@ begin
 
 ---
 
-**Modification B: Instantiation and GPIO Synchronizer Fix (around line 990)**
+**Modification B: Added signal for modified GPIO input (around line 194)**
+
+Added:
+```vhdl
+signal half_adder_out : std_logic_vector(31 downto 0);
+signal nios_gpi_modified : std_logic_vector(31 downto 0);  -- NEW: for injecting half-adder outputs
+```
+
+---
+
+**Modification C: Changed NIOS GPIO input to use modified signal (around line 394)**
+
+Changed:
+```vhdl
+gpio_in_port => pack(nios_gpio.i, '0'),
+```
+
+To:
+```vhdl
+gpio_in_port => nios_gpi_modified,  -- Modified to include half-adder outputs
+```
+
+---
+
+**Modification D: Instantiation using Config GPIO (around line 990)**
+
+**FINAL VERSION (after fixing expansion GPIO issue):**
 
 Replaced:
 ```vhdl
@@ -119,12 +145,12 @@ generate_sync_xb_gpio_in : for i in exp_gpio'range generate
 end generate;
 ```
 
-With:
+With (FIRST ATTEMPT - used wrong GPIO):
 ```vhdl
 -- Instantiate half-adder
 U_half_adder : half_adder_gpio
     port map (
-        gpio_in  => nios_xb_gpio_out,
+        gpio_in  => nios_xb_gpio_out,  -- ❌ WRONG: expansion GPIO not accessible
         gpio_out => half_adder_out
     );
 
@@ -147,13 +173,58 @@ generate_sync_xb_gpio_in : for i in exp_gpio'range generate
 end generate;
 ```
 
+Then changed to (FINAL - uses correct config GPIO):
+```vhdl
+-- Instantiate half-adder (using config GPIO, not expansion GPIO)
+U_half_adder : half_adder_gpio
+    port map (
+        gpio_in  => nios_gpo_slv,        -- ✅ Config GPIO outputs (bits 1:0 = A,B)
+        gpio_out => half_adder_out       -- Half-adder outputs (bits 3:2 = SUM,COUT)
+    );
+
+-- Modify GPIO inputs to include half-adder outputs
+-- Pack normal GPIO inputs but override bits 3:2 with half-adder outputs (SUM, COUT)
+-- Bits 1:0 are used as inputs (A, B) via nios_gpo_slv
+process(nios_gpio, half_adder_out)
+    variable temp : std_logic_vector(31 downto 0);
+begin
+    temp := pack(nios_gpio.i, '0');
+    temp(3 downto 2) := half_adder_out(3 downto 2);
+    nios_gpi_modified <= temp;
+end process;
+
+-- Restore expansion GPIO synchronizer (no longer modified)
+generate_sync_xb_gpio_in : for i in exp_gpio'range generate
+    U_sync_xb_gpio_in : entity work.synchronizer
+      generic map (
+        RESET_LEVEL => '0'
+      ) port map (
+        reset => '0',
+        clock => sys_clock,
+        async => exp_gpio(i),
+        sync  => nios_xb_gpio_in(i)
+      );
+end generate;
+```
+
 **Purpose:**
 1. Instantiate half-adder logic
-2. Connect GPIO write signals (nios_xb_gpio_out) to half-adder inputs
-3. Route half-adder outputs back to GPIO read signals (nios_xb_gpio_in)
-4. Fix multiple driver error by excluding bits 2,3 from synchronizer
+2. Connect Config GPIO outputs (`nios_gpo_slv`) to half-adder inputs
+3. Route half-adder outputs back to GPIO read via modified input signal
+4. Use process to merge half-adder outputs into GPIO input word
 
-**Critical fix:** The conditional generate `if (i /= 2 and i /= 3)` prevents VHDL multiple driver error
+**Key Changes:**
+- Input source: `nios_gpo_slv` (config GPIO) instead of `nios_xb_gpio_out` (expansion GPIO)
+- Output routing: Through `nios_gpi_modified` signal to NIOS input port
+- No longer modifying expansion GPIO synchronizer
+
+**GPIO Bit Mapping (Config GPIO):**
+- **Bit 0** (write) → A input to half-adder
+- **Bit 1** (write) → B input to half-adder  
+- **Bit 2** (read) → SUM output from half-adder
+- **Bit 3** (read) → COUT output from half-adder
+- Bits 0-1 are spare output bits in nios_gpo_t
+- Bits 2-3 are injected into the input word read by software
 
 ---
 
@@ -293,11 +364,12 @@ export PATH="/c/intelFPGA_lite/20.1/nios2eds/sdk2/bin:$PATH"
 **Symptom:** `AttributeError: 'BladeRF' object has no attribute 'config_gpio_write'`  
 **Solution:** Use C programs with libbladeRF instead
 
-### Issue 6: Wrong GPIO Bank (CURRENT ISSUE)
-**Problem:** Used `bladerf_config_gpio_*` but half-adder is on expansion GPIO  
+### Issue 6: Wrong GPIO Bank (FIXED)
+**Problem:** Wired half-adder to `nios_xb_gpio` (expansion GPIO) which isn't accessible via USB on bladeRF2 Micro  
 **Symptom:** Writes don't reach FPGA, reads always return 0  
-**Solution:** Need to use `bladerf_expansion_gpio_*` functions or NIOS backend directly  
-**Status:** **DEBUGGING IN PROGRESS**
+**Root cause:** Expansion GPIO uses SPI (write-only), not accessible through standard GPIO API  
+**Solution:** Rewired to use `nios_gpio` (config GPIO) which IS accessible via `bladerf_config_gpio_*` functions  
+**Status:** **FIXED** - Changed VHDL to use config GPIO instead of expansion GPIO
 
 ---
 
@@ -315,11 +387,16 @@ export PATH="/c/intelFPGA_lite/20.1/nios2eds/sdk2/bin:$PATH"
 
 | Test | Status | Notes |
 |------|--------|-------|
-| FPGA Build | ✅ Complete | 13 MB .rbf file generated successfully |
+| FPGA Build (A4) | ✅ Complete | Wrong size - device rejected |
+| FPGA Build (A9) | ✅ Complete | 13 MB .rbf file generated successfully |
 | FPGA Load | ✅ Working | Image loads on bladeRF2 without errors |
-| GPIO Write | ❌ **FAILING** | Writes to expansion GPIO return 0 on read |
-| Half-Adder Logic | ⏳ Untested | Can't test until GPIO access works |
-| End-to-End | ⏳ Pending | Waiting for GPIO fix |
+| GPIO Write (expansion) | ❌ Failed | Expansion GPIO not accessible via USB |
+| GPIO Fix (config GPIO) | ✅ Fixed | Rewired to use config GPIO |
+| Rebuild Required | ⏳ Pending | Need to rebuild with fixed VHDL |
+| Half-Adder Logic | ⏳ Untested | Will test after rebuild |
+| End-to-End | ⏳ Pending | Waiting for rebuild |
+
+**Current Status:** VHDL fixed, ready to rebuild FPGA image
 
 ---
 
@@ -347,5 +424,13 @@ Key commits:
 
 ---
 
-**Last Updated:** August 13, 2026 - 19:30  
-**Status:** GPIO access issue being debugged
+**Last Updated:** August 13, 2026 - 21:45  
+**Status:** VHDL fixed to use config GPIO - ready to rebuild FPGA image
+
+## 🔄 Next Steps
+
+1. **Copy fixed bladerf-hosted.vhd back to bladeRF repository** (on PC)
+2. **Rebuild FPGA image** following same process as before (~30-40 min)
+3. **Copy new .rbf to version_vikram and push to GitHub**
+4. **Test on Raspberry Pi** using existing C test programs
+5. **Update test programs** to use `bladerf_config_gpio_*` functions (already correct!)
