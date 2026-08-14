@@ -7,7 +7,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <unistd.h>
-#include <libbladeRF.h>
+#include <libbladeRF.h>  // Includes both bladeRF1.h and bladeRF2.h
 
 /* From nios_access.h - these are backend functions */
 extern int nios_expansion_gpio_read(struct bladerf *dev, uint32_t *val);
