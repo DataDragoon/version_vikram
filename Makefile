@@ -1,21 +1,32 @@
-# Makefile for 16-bit Adder Test
+# Makefile for 16-bit Adder Tests
 
 CC = gcc
 CFLAGS = -Wall -Wextra -O2
 LDFLAGS = -lbladeRF
 
-TARGET = test_adder_16bit
-SRC = test_adder_16bit.c
+TARGETS = test_adder_16bit test_adder_16bit_fixed test_adder_small
 
-all: $(TARGET)
+all: $(TARGETS)
 
-$(TARGET): $(SRC)
-	$(CC) $(CFLAGS) -o $(TARGET) $(SRC) $(LDFLAGS)
+test_adder_16bit: test_adder_16bit.c
+	$(CC) $(CFLAGS) -o test_adder_16bit test_adder_16bit.c $(LDFLAGS)
+
+test_adder_16bit_fixed: test_adder_16bit_fixed.c
+	$(CC) $(CFLAGS) -o test_adder_16bit_fixed test_adder_16bit_fixed.c $(LDFLAGS)
+
+test_adder_small: test_adder_small.c
+	$(CC) $(CFLAGS) -o test_adder_small test_adder_small.c $(LDFLAGS)
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGETS)
 
-run: $(TARGET)
-	./$(TARGET)
+run: test_adder_16bit
+	./test_adder_16bit
 
-.PHONY: all clean run
+run-fixed: test_adder_16bit_fixed
+	./test_adder_16bit_fixed
+
+run-small: test_adder_small
+	./test_adder_small
+
+.PHONY: all clean run run-fixed run-small
