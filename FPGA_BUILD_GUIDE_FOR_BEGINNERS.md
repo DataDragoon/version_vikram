@@ -187,6 +187,28 @@ Edit: `~/bladeRF/hdl/fpga/platforms/bladerf-micro/vhdl/bladerf-hosted.vhd`
 
 This file integrates your Verilog modules into the bladeRF FPGA design.
 
+---
+
+### ⚠️ CRITICAL: GPIO Read-Back Issue
+
+**DO NOT** connect your logic output directly to `gpio_in_port`!
+
+**Why?** The NIOS GPIO controller uses a **read-modify-write protocol**:
+1. NIOS writes value X to GPIO
+2. NIOS reads back GPIO to verify the write
+3. NIOS expects to see X (what it wrote)
+4. If it reads Y (your logic output) instead, the GPIO state machine gets confused
+5. After 3-4 operations, NIOS crashes and USB disconnects
+
+**Solution:** Use a **merge process** that:
+- Starts with what NIOS wrote (upper bits preserved)
+- Overrides only the bits containing your logic result
+- Feeds this merged signal back to NIOS
+
+This is explained in steps 3.2, 3.3, and 3.4 below.
+
+---
+
 ### 3.1 Declare Component
 
 **Find line ~185** (search for `begin` keyword and add BEFORE it):
@@ -201,15 +223,29 @@ This file integrates your Verilog modules into the bladeRF FPGA design.
             gpio_out : out std_logic_vector(31 downto 0)
         );
     end component;
-
-    signal your_logic_output : std_logic_vector(31 downto 0);
 ```
 
 **Replace `your_logic` with your actual module name!**
 
+⚠️ **Important:** Signal declarations are in the next step (3.2)
+
 ---
 
-### 3.2 Connect to NIOS GPIO
+### 3.2 Add Merged GPIO Signal Declaration
+
+**Find line ~193** (after `signal adder_16bit_out` or similar declarations):
+
+**Add:**
+```vhdl
+    signal your_logic_output : std_logic_vector(31 downto 0);
+    signal nios_gpi_modified : std_logic_vector(31 downto 0);  -- Merged GPIO signal
+```
+
+⚠️ **CRITICAL:** The `nios_gpi_modified` signal is required to preserve NIOS GPIO read-back functionality!
+
+---
+
+### 3.3 Connect to NIOS GPIO
 
 **Find line ~393** (search for `gpio_in_port`):
 
@@ -220,7 +256,7 @@ gpio_in_port => pack(nios_gpio.i, '0'),
 
 **To:**
 ```vhdl
-gpio_in_port => your_logic_output,  -- PC reads your FPGA output here
+gpio_in_port => nios_gpi_modified,  -- CRITICAL: Use merged signal!
 ```
 
 **Keep:**
@@ -228,15 +264,37 @@ gpio_in_port => your_logic_output,  -- PC reads your FPGA output here
 gpio_out_port => nios_gpo_slv,      -- PC writes to FPGA here
 ```
 
+⚠️ **WARNING:** Do NOT connect `your_logic_output` directly! This breaks NIOS GPIO protocol and causes crashes after 3-4 operations.
+
 ---
 
-### 3.3 Instantiate Your Module
+### 3.4 Add GPIO Merge Process
 
 **Find line ~988** (search for `generate_sync_xb_gpio_in`):
 
 **Add BEFORE that section:**
 
 ```vhdl
+    -- ============================================
+    -- Merge GPIO output with your logic result
+    -- This preserves NIOS GPIO read-back functionality
+    -- CRITICAL: Without this, NIOS will crash after 3-4 GPIO operations!
+    -- ============================================
+    process(nios_gpo_slv, your_logic_output)
+        variable temp : std_logic_vector(31 downto 0);
+    begin
+        -- Start with what NIOS wrote (for proper read-back)
+        temp := nios_gpo_slv;
+        
+        -- Override specific bits with your logic result
+        -- CUSTOMIZE THESE BIT RANGES for your logic!
+        temp(15 downto 0) := your_logic_output(15 downto 0);  -- Your result bits
+        temp(16) := your_logic_output(16);                     -- Your carry/status bit
+        -- Bits 17-31 remain as NIOS wrote them
+        
+        nios_gpi_modified <= temp;
+    end process;
+
     -- ============================================
     -- Your Custom Logic Instantiation
     -- ============================================
@@ -248,6 +306,8 @@ gpio_out_port => nios_gpo_slv,      -- PC writes to FPGA here
 ```
 
 **Replace `your_logic` with your actual module name!**
+
+**Customize the bit ranges** in the merge process to match your GPIO mapping!
 
 **Save and close** the file.
 
@@ -271,10 +331,12 @@ export SOPC_KIT_NIOS2="/c/intelFPGA_lite/20.1/nios2eds"
 export PATH="/c/intelFPGA_lite/20.1/quartus/bin64:$PATH"
 export PATH="/c/intelFPGA_lite/20.1/quartus/sopc_builder/bin:$PATH"
 export PATH="/c/intelFPGA_lite/20.1/nios2eds/sdk2/bin:$PATH"
+export PATH="/c/intelFPGA_lite/20.1/nios2eds/bin:$PATH"
 export PATH="/c/intelFPGA_lite/20.1/nios2eds/bin/gnu/H-x86_64-mingw32/bin:$PATH"
 
 # Verify tools are found
 which quartus_sh
+which nios2-stackreport
 quartus_sh --version | head -3
 ```
 
@@ -317,17 +379,34 @@ The script will:
 2. **Build BSP** (~3 min)  
    **⚠️ If BSP fails with "No rule to make target" error:**
    
+   This is a known issue on Windows Git Bash. The Makefile uses `$(shell pwd)` which returns MSYS paths that Windows make.exe can't parse.
+   
+   **Quick Fix (Automatic):**
    ```bash
-   # Fix the BSP Makefile
-   cd work/bladerf-micro-A9-hosted/bladeRF_nios_bsp
+   cd ~/bladeRF/hdl/quartus/work/bladerf-micro-A9-hosted/bladeRF_nios_bsp
    
-   # Replace line 65
-   sed -i 's|ABS_BSP_ROOT := $(shell pwd)|ABS_BSP_ROOT := C:/Users/YOUR_USERNAME/bladeRF/hdl/quartus/work/bladerf-micro-A9-hosted/bladeRF_nios_bsp|' Makefile
+   # Auto-detect username and fix Makefile
+   USERNAME=$(whoami)
+   sed -i "s|ABS_BSP_ROOT := \$(shell pwd)|ABS_BSP_ROOT := C:/Users/$USERNAME/bladeRF/hdl/quartus/work/bladerf-micro-A9-hosted/bladeRF_nios_bsp|" Makefile
    
-   # Build BSP manually
+   # Build BSP
    make
    
-   # Continue with mem_init generation (next step)
+   # Go back to continue the build
+   cd ~/bladeRF/hdl/quartus
+   ./build_bladerf.sh -b bladeRF-micro -s A9 -r hosted
+   ```
+   
+   **Manual Fix (if auto-detect fails):**
+   ```bash
+   cd ~/bladeRF/hdl/quartus/work/bladerf-micro-A9-hosted/bladeRF_nios_bsp
+   
+   # Replace YOUR_USERNAME with your actual Windows username!
+   sed -i 's|ABS_BSP_ROOT := $(shell pwd)|ABS_BSP_ROOT := C:/Users/YOUR_USERNAME/bladeRF/hdl/quartus/work/bladerf-micro-A9-hosted/bladeRF_nios_bsp|' Makefile
+   
+   make
+   cd ~/bladeRF/hdl/quartus
+   ./build_bladerf.sh -b bladeRF-micro -s A9 -r hosted
    ```
 
 3. **Generate memory files** (~2 min)
@@ -517,14 +596,17 @@ Expected: 100 + 200 = 300 (carry=0)
 
 #### Error: "No rule to make target system.h"
 
-**Problem:** BSP Makefile has MSYS path issues
+**Problem:** BSP Makefile has MSYS path issues (Windows Git Bash)
+
+**Cause:** `$(shell pwd)` returns MSYS paths like `/c/Users/...` which Windows make.exe interprets as `/c/Users/...` (relative path), not `C:/Users/...` (absolute path).
 
 **Solution:**
 ```bash
 cd ~/bladeRF/hdl/quartus/work/bladerf-micro-A9-hosted/bladeRF_nios_bsp
 
-# Fix Makefile line 65
-sed -i 's|ABS_BSP_ROOT := $(shell pwd)|ABS_BSP_ROOT := C:/Users/YOUR_USERNAME/bladeRF/hdl/quartus/work/bladerf-micro-A9-hosted/bladeRF_nios_bsp|' Makefile
+# Auto-fix (detects your username)
+USERNAME=$(whoami)
+sed -i "s|ABS_BSP_ROOT := \$(shell pwd)|ABS_BSP_ROOT := C:/Users/$USERNAME/bladeRF/hdl/quartus/work/bladerf-micro-A9-hosted/bladeRF_nios_bsp|" Makefile
 
 # Build manually
 make
@@ -569,6 +651,34 @@ bladeRF-cli -e "info"
 # Linux: Check USB permissions
 sudo bladeRF-cli -e "info"
 ```
+
+---
+
+#### NIOS Crashes After 3-4 GPIO Operations
+
+**Problem:** Device disconnects after a few successful GPIO reads/writes
+
+**Symptoms:**
+- Tests 1-3 pass correctly
+- Test 4 onwards: "Failed to receive NIOS II response"
+- USB disconnects
+- Must reload FPGA to try again
+
+**Cause:** GPIO read-back feedback loop broken. NIOS expects to read back what it wrote, but is only seeing your logic output. This confuses the GPIO state machine.
+
+**Solution:** Add the GPIO merge process (see Step 3.4):
+```vhdl
+process(nios_gpo_slv, your_logic_output)
+    variable temp : std_logic_vector(31 downto 0);
+begin
+    temp := nios_gpo_slv;
+    temp(15 downto 0) := your_logic_output(15 downto 0);
+    temp(16) := your_logic_output(16);
+    nios_gpi_modified <= temp;
+end process;
+```
+
+And connect `gpio_in_port => nios_gpi_modified` (NOT `your_logic_output`!)
 
 ---
 
@@ -636,6 +746,7 @@ export SOPC_KIT_NIOS2="/c/intelFPGA_lite/20.1/nios2eds"
 export PATH="/c/intelFPGA_lite/20.1/quartus/bin64:$PATH"
 export PATH="/c/intelFPGA_lite/20.1/quartus/sopc_builder/bin:$PATH"
 export PATH="/c/intelFPGA_lite/20.1/nios2eds/sdk2/bin:$PATH"
+export PATH="/c/intelFPGA_lite/20.1/nios2eds/bin:$PATH"
 export PATH="/c/intelFPGA_lite/20.1/nios2eds/bin/gnu/H-x86_64-mingw32/bin:$PATH"
 
 # 2. Build FPGA image (replace A9 with your FPGA size)
@@ -643,10 +754,11 @@ export PATH="/c/intelFPGA_lite/20.1/nios2eds/bin/gnu/H-x86_64-mingw32/bin:$PATH"
 
 # 3. If BSP fails, fix and build manually
 cd work/bladerf-micro-A9-hosted/bladeRF_nios_bsp
-sed -i 's|ABS_BSP_ROOT := $(shell pwd)|ABS_BSP_ROOT := C:/Users/YOUR_USERNAME/bladeRF/hdl/quartus/work/bladerf-micro-A9-hosted/bladeRF_nios_bsp|' Makefile
+USERNAME=$(whoami)
+sed -i "s|ABS_BSP_ROOT := \$(shell pwd)|ABS_BSP_ROOT := C:/Users/$USERNAME/bladeRF/hdl/quartus/work/bladerf-micro-A9-hosted/bladeRF_nios_bsp|" Makefile
 make
-cd ../../fpga/platforms/bladerf-micro/software/bladeRF_nios
-make WORKDIR=work/bladerf-micro-A9-hosted mem_init_generate
+cd ~/bladeRF/hdl/fpga/platforms/bladerf-micro/software/bladeRF_nios
+make WORKDIR=../../../../quartus/work/bladerf-micro-A9-hosted mem_init_generate
 
 # 4. Continue Quartus build manually if needed
 cd ../../../../quartus/work/bladerf-micro-A9-hosted
@@ -675,17 +787,25 @@ gcc -o test test.c -lbladeRF
 
 ## Example: Working 16-bit Adder
 
-This repository includes a working example of a 16-bit adder:
+This repository includes a working example of a 16-bit adder with the **correct GPIO merge fix**:
 
 **Files:**
-- `bladeRF/hdl/fpga/platforms/bladerf-micro/vhdl/adder_16bit.v`
-- `bladeRF/hdl/fpga/platforms/bladerf-micro/vhdl/adder_16bit_gpio.v`
-- Integration already done in `bladerf-hosted.vhd`
+- `bladeRF/hdl/fpga/platforms/bladerf-micro/vhdl/adder_16bit.v` - Core adder logic
+- `bladeRF/hdl/fpga/platforms/bladerf-micro/vhdl/adder_16bit_gpio.v` - GPIO wrapper
+- Integration in `bladerf-hosted.vhd`:
+  - ✅ Component declaration (line ~185)
+  - ✅ Signal declarations (line ~193): `adder_16bit_out` and `nios_gpi_modified`
+  - ✅ GPIO connection (line ~394): `gpio_in_port => nios_gpi_modified`
+  - ✅ Merge process (line ~985): Combines NIOS writes with adder output
+  - ✅ Adder instantiation (line ~1007)
 
-**Test program:**
-- `version_vikram/test_adder_16bit.c`
+**Test programs:**
+- `version_vikram/test_adder_16bit.c` - Full test suite (15 tests)
+- `version_vikram/test_adder_small.c` - Small value tests
 
-Study these files as a reference for your own custom logic!
+**Note:** The merge process at line ~985 is the **critical fix** that prevents NIOS crashes. Study this pattern for your own custom logic!
+
+**See also:** `FPGA_Fix_Quick_Reference.md` on your Desktop for the exact 3 changes needed.
 
 ---
 
@@ -733,5 +853,6 @@ You now know how to:
 
 ---
 
-**Last Updated:** August 14, 2026  
-**Tested On:** bladeRF2 Micro (A9), Windows 11, Quartus 20.1.1
+**Last Updated:** August 15, 2026  
+**Tested On:** bladeRF2 Micro (A9), Windows 11, Quartus 20.1.1  
+**Includes:** GPIO merge fix (prevents NIOS crashes after 3-4 operations)
