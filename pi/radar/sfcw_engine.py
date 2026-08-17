@@ -15,7 +15,7 @@ import time
 import numpy as np
 
 from bladerf_driver import BladeRFDriver
-from bladerf._bladerf import ChannelLayout, Format, libbladeRF
+from bladerf._bladerf import ChannelLayout, Format, ffi, libbladeRF
 import bladerf
 
 LUT_PATH = os.path.join(os.path.dirname(__file__), 'tx1_amp_lut.json')
@@ -31,11 +31,11 @@ class SFCWEngine:
         self.stop_freq = 5_000_000_000
         self.step_size = 20_000_000
         self.settle_time = 0.003
-        self.num_buffers = 4
-        self.tx1_gain = 44
-        self.rx1_gain = 25
-        self.tx2_gain = 44
-        self.rx2_gain = 25
+        self.num_buffers = 1
+        self.tx1_gain = 30
+        self.rx1_gain = 30
+        self.tx2_gain = 30
+        self.rx2_gain = 20
         self.rx_gain_min = 5
         self.rx_gain_max = 38
         self.range_offset = 0.5
@@ -48,6 +48,8 @@ class SFCWEngine:
         self._lock = threading.Lock()
         self._background = None
         self._capture_background = False
+        self._capture_bscan = False
+        self._capture_bscan_bg = False
         self._bg_subtract_mode = 'complex'  # 'complex' or 'magnitude'
         self._last_h_cal = None
         self._fpga_tuning = False
@@ -60,6 +62,11 @@ class SFCWEngine:
         self._tx2_amp_lut_freqs = None
         self._load_tx1_amp_lut()
         self._load_tx2_amp_lut()
+        self._qt_profiles_rx = None
+        self._qt_profiles_tx = None
+        self._qt_params = None
+        self._use_quick_tune = True
+        self._rx_cond = threading.Condition()
 
     def _load_tx1_amp_lut(self):
         """Load per-frequency TX1 amplitude lookup table."""
@@ -203,6 +210,12 @@ class SFCWEngine:
 
     def capture_background(self):
         self._capture_background = True
+
+    def capture_bscan(self):
+        self._capture_bscan = True
+
+    def capture_bscan_bg(self):
+        self._capture_bscan_bg = True
 
     def clear_background(self):
         self._background = None
@@ -415,53 +428,66 @@ class SFCWEngine:
             self._stop_tx_rx()
             self.running = False
 
+    def _generate_quick_tune_profiles(self):
+        """Generate and cache quick_tune profiles for all sweep frequencies.
+
+        Must be called before streaming starts (set_frequency does full VCO cal).
+        Profiles are reused across sweeps until parameters change.
+        """
+        with self._lock:
+            start = self.start_freq
+            stop = self.stop_freq
+            step = self.step_size
+
+        params_key = (start, stop, step)
+        if self._qt_params == params_key and self._qt_profiles_rx is not None:
+            return
+
+        num_steps = int((stop - start) / step) + 1
+        freqs = np.linspace(start, stop, num_steps).astype(np.int64)
+        dev_ptr = self.driver.device.dev[0]
+
+        qt_rx = []
+        qt_tx = []
+        for f in freqs:
+            f_int = int(f)
+            libbladeRF.bladerf_set_frequency(dev_ptr, bladerf.CHANNEL_RX(0), f_int)
+            libbladeRF.bladerf_set_frequency(dev_ptr, bladerf.CHANNEL_TX(0), f_int)
+            qr = ffi.new('struct bladerf_quick_tune *')
+            qt_val = ffi.new('struct bladerf_quick_tune *')
+            libbladeRF.bladerf_get_quick_tune(dev_ptr, bladerf.CHANNEL_RX(0), qr)
+            libbladeRF.bladerf_get_quick_tune(dev_ptr, bladerf.CHANNEL_TX(0), qt_val)
+            qt_rx.append(qr)
+            qt_tx.append(qt_val)
+
+        self._qt_profiles_rx = qt_rx
+        self._qt_profiles_tx = qt_tx
+        self._qt_params = params_key
+        print(f"[sfcw] Generated {num_steps} quick_tune profiles")
+
     def _configure_hardware(self):
         self.driver.tx_gain = self.tx1_gain
         self.driver.rx_gain = self.rx1_gain
         self.driver.tx2_gain = self.tx2_gain
         self.driver.rx2_gain = self.rx2_gain
-        self.driver.sample_rate = 2_000_000
-        self.driver.bandwidth = 1_500_000
-        # TX1/TX2 amplitude will be set per-step from LUTs; set initial values
-        initial_tx1_amp = self._get_tx1_amplitude(self.start_freq)
-        self.driver.set_waveform('cw', offset=100_000, amplitude=initial_tx1_amp)
-        self._tx2_amp = 0.05
+        self.driver.sample_rate = 10_000_000
+        self.driver.bandwidth = 8_000_000
+        self.driver.set_waveform('cw', offset=100_000, amplitude=0.9)
+        if self._use_quick_tune:
+            self._generate_quick_tune_profiles()
         self.driver._configure_channels_dual()
         self.driver.set_tuning_mode_fpga()
         self._fpga_tuning = True
 
     def _start_tx_rx(self):
-        self._rx_lock = threading.Lock()
+        self._rx_cond = threading.Condition()
         self._rx_latest = None
         self._rx_seq = 0
-        n = 1024
+        n = 4096
         t = np.arange(n, dtype=np.float64) / self.driver.sample_rate
         self._ref_tone = np.exp(-1j * 2 * np.pi * self.driver.cw_offset * t)
-        # Pre-build initial TX buffer with separate TX1/TX2 amplitudes
-        if self._tx1_amp_lut is not None:
-            initial_tx1_amp = self._get_tx1_amplitude(self.start_freq)
-            initial_buf = self._build_tx_dual_buffer(initial_tx1_amp, self._tx2_amp)
-            self.driver._tx_buffer = self.driver._generate(int(self.driver.sample_rate * 0.01))
-            self.driver._tx_dual_bytes = initial_buf
-            self.driver._tx_dual_n_samples = int(self.driver.sample_rate * 0.01)
-            # Manually start TX dual without rebuilding the buffer
-            self.driver._tx_stop.clear()
-            self.driver.tx_running = True
-            self.driver._dual_channel = True
-            self.driver.device.sync_config(
-                layout=ChannelLayout.TX_X2,
-                fmt=Format.SC16_Q11,
-                num_buffers=16,
-                buffer_size=4096,
-                num_transfers=8,
-                stream_timeout=3500
-            )
-            self.driver.device.enable_module(bladerf.CHANNEL_TX(0), True)
-            self.driver.device.enable_module(bladerf.CHANNEL_TX(1), True)
-            self.driver._tx_thread = threading.Thread(target=self.driver._tx_loop_dual, daemon=True)
-            self.driver._tx_thread.start()
-        else:
-            self.driver.start_tx_dual()
+        self._ref_tone_scaled = self._ref_tone / 2047.0
+        self.driver.start_tx_dual()
         self.driver.start_rx_dual(self._rx_capture, num_samples=n)
         time.sleep(0.05)
 
@@ -491,9 +517,10 @@ class SFCWEngine:
 
 
     def _rx_capture(self, rx1_iq, rx2_iq):
-        with self._rx_lock:
+        with self._rx_cond:
             self._rx_latest = (rx1_iq, rx2_iq)
             self._rx_seq += 1
+            self._rx_cond.notify_all()
 
     def _perform_sweep(self):
         with self._lock:
@@ -513,15 +540,9 @@ class SFCWEngine:
         rx_ch = bladerf.CHANNEL_RX(0)
         rx_ch1 = bladerf.CHANNEL_RX(1)
 
-        # Pre-compute per-step TX buffers with both TX1 and TX2 amplitudes from LUTs
-        tx_buffers = None
-        tx1_amplitudes = None
-        tx2_amplitudes = None
-        if self._tx1_amp_lut is not None or self._tx2_amp_lut is not None:
-            tx1_amplitudes = np.array([self._get_tx1_amplitude(f) for f in freqs])
-            tx2_amplitudes = np.array([self._get_tx2_amplitude(f) for f in freqs])
-            tx_buffers = [self._build_tx_dual_buffer(tx1_amplitudes[i], tx2_amplitudes[i])
-                          for i in range(num_steps)]
+        use_qt = (self._use_quick_tune and self._qt_profiles_rx is not None
+                  and len(self._qt_profiles_rx) == num_steps)
+        settle_count = 10 if use_qt else 2
 
         dropped_steps = 0
 
@@ -530,67 +551,47 @@ class SFCWEngine:
                 return None
 
             f = int(freqs[i])
+            if use_qt:
+                libbladeRF.bladerf_schedule_retune(dev_ptr, rx_ch, 0, f, self._qt_profiles_rx[i])
+                libbladeRF.bladerf_schedule_retune(dev_ptr, tx_ch, 0, f, self._qt_profiles_tx[i])
+            else:
+                libbladeRF.bladerf_set_frequency(dev_ptr, tx_ch, f)
+                libbladeRF.bladerf_set_frequency(dev_ptr, rx_ch, f)
 
-            # Update TX buffer for this step (per-step TX1 + TX2 amplitudes)
-            if tx_buffers is not None:
-                self.driver.set_tx_dual_buffer(tx_buffers[i])
-
-            libbladeRF.bladerf_set_frequency(dev_ptr, tx_ch, f)
-            libbladeRF.bladerf_set_frequency(dev_ptr, rx_ch, f)
-
-            # Wait for settle: skip buffers that arrived before/during retune.
-            # Read the current seq, then wait for 2 new buffers past that point.
-            with self._rx_lock:
-                seq_after_retune = self._rx_seq
-            target_seq = seq_after_retune + 2
-            deadline = time.monotonic() + 1.0
-            while True:
-                with self._rx_lock:
-                    if self._rx_seq >= target_seq:
+            # Wait for PLL settle after retune
+            with self._rx_cond:
+                target_seq = self._rx_seq + settle_count
+                while self._rx_seq < target_seq:
+                    if not self._rx_cond.wait(timeout=1.0):
                         break
-                if time.monotonic() > deadline:
-                    break
-                time.sleep(0.0002)
 
             # Capture num_buffers fresh samples, each waiting for a new seq tick
-            sig_accum = 0j
-            ref_accum = 0j
-            captured = 0
-            with self._rx_lock:
+            rx1_bufs = []
+            rx2_bufs = []
+            with self._rx_cond:
                 last_seq = self._rx_seq
 
             for _ in range(num_buffers):
-                # Wait for the next fresh buffer
-                deadline = time.monotonic() + 1.0
-                while True:
-                    with self._rx_lock:
-                        if self._rx_seq > last_seq:
-                            rx1, rx2 = self._rx_latest
-                            last_seq = self._rx_seq
+                with self._rx_cond:
+                    while self._rx_seq <= last_seq:
+                        if not self._rx_cond.wait(timeout=1.0):
                             break
-                    if time.monotonic() > deadline:
-                        rx1, rx2 = None, None
-                        break
-                    time.sleep(0.0002)
+                    if self._rx_seq > last_seq:
+                        rx1_bufs.append(self._rx_latest[0])
+                        rx2_bufs.append(self._rx_latest[1])
+                        last_seq = self._rx_seq
 
-                if rx1 is None or rx2 is None:
-                    continue
-
-                i1 = rx1[0::2].astype(np.float64) / 2047.0
-                q1 = rx1[1::2].astype(np.float64) / 2047.0
-                sig_accum += np.mean((i1 + 1j * q1) * self._ref_tone)
-
-                i2 = rx2[0::2].astype(np.float64) / 2047.0
-                q2 = rx2[1::2].astype(np.float64) / 2047.0
-                ref_accum += np.mean((i2 + 1j * q2) * self._ref_tone)
-
-                captured += 1
-
-            if captured < num_buffers:
+            captured = len(rx1_bufs)
+            if captured > 0:
+                # Batch deinterleave + complex conversion + ref_tone correlation
+                sig_arr = np.array(rx1_bufs, dtype=np.float64)
+                ref_arr = np.array(rx2_bufs, dtype=np.float64)
+                sig_cplx = (sig_arr[:, 0::2] + 1j * sig_arr[:, 1::2]) * self._ref_tone_scaled
+                ref_cplx = (ref_arr[:, 0::2] + 1j * ref_arr[:, 1::2]) * self._ref_tone_scaled
+                h_signal[i] = sig_cplx.mean()
+                h_reference[i] = ref_cplx.mean()
+            else:
                 dropped_steps += 1
-
-            h_signal[i] = sig_accum / max(captured, 1)
-            h_reference[i] = ref_accum / max(captured, 1)
 
             if self._callback and i % 10 == 0:
                 self._callback({
@@ -602,17 +603,6 @@ class SFCWEngine:
 
         if dropped_steps > 0:
             print(f"[sfcw] WARNING: {dropped_steps}/{num_steps} steps had incomplete captures")
-
-        # Normalize out per-step digital amplitude variations before calibration
-        # h_signal ∝ TX1_amp, h_reference ∝ TX2_amp
-        if tx1_amplitudes is not None:
-            for i in range(num_steps):
-                if tx1_amplitudes[i] > 0.001:
-                    h_signal[i] /= tx1_amplitudes[i]
-        if tx2_amplitudes is not None:
-            for i in range(num_steps):
-                if tx2_amplitudes[i] > 0.001:
-                    h_reference[i] /= tx2_amplitudes[i]
 
         # Phase-reference division: cancels TX and RX PLL phase offsets
         ref_mag = np.abs(h_reference)
@@ -647,15 +637,9 @@ class SFCWEngine:
         tx_ch = bladerf.CHANNEL_TX(0)
         rx_ch = bladerf.CHANNEL_RX(0)
 
-        # Pre-compute per-step TX buffers with both TX1 and TX2 amplitudes from LUTs
-        tx_buffers = None
-        tx1_amplitudes = None
-        tx2_amplitudes = None
-        if self._tx1_amp_lut is not None or self._tx2_amp_lut is not None:
-            tx1_amplitudes = np.array([self._get_tx1_amplitude(f) for f in freqs])
-            tx2_amplitudes = np.array([self._get_tx2_amplitude(f) for f in freqs])
-            tx_buffers = [self._build_tx_dual_buffer(tx1_amplitudes[i], tx2_amplitudes[i])
-                          for i in range(num_steps)]
+        use_qt = (self._use_quick_tune and self._qt_profiles_rx is not None
+                  and len(self._qt_profiles_rx) == num_steps)
+        settle_count = 10 if use_qt else 2
 
         dropped_steps = 0
 
@@ -664,72 +648,44 @@ class SFCWEngine:
                 return None
 
             f = int(freqs[i])
+            if use_qt:
+                libbladeRF.bladerf_schedule_retune(dev_ptr, rx_ch, 0, f, self._qt_profiles_rx[i])
+                libbladeRF.bladerf_schedule_retune(dev_ptr, tx_ch, 0, f, self._qt_profiles_tx[i])
+            else:
+                libbladeRF.bladerf_set_frequency(dev_ptr, tx_ch, f)
+                libbladeRF.bladerf_set_frequency(dev_ptr, rx_ch, f)
 
-            if tx_buffers is not None:
-                self.driver.set_tx_dual_buffer(tx_buffers[i])
-
-            libbladeRF.bladerf_set_frequency(dev_ptr, tx_ch, f)
-            libbladeRF.bladerf_set_frequency(dev_ptr, rx_ch, f)
-
-            with self._rx_lock:
-                seq_after_retune = self._rx_seq
-            target_seq = seq_after_retune + 2
-            deadline = time.monotonic() + 1.0
-            while True:
-                with self._rx_lock:
-                    if self._rx_seq >= target_seq:
+            with self._rx_cond:
+                target_seq = self._rx_seq + settle_count
+                while self._rx_seq < target_seq:
+                    if not self._rx_cond.wait(timeout=1.0):
                         break
-                if time.monotonic() > deadline:
-                    break
-                time.sleep(0.0002)
 
-            sig_accum = 0j
-            ref_accum = 0j
-            captured = 0
-            with self._rx_lock:
+            rx1_bufs = []
+            rx2_bufs = []
+            with self._rx_cond:
                 last_seq = self._rx_seq
 
             for _ in range(num_buffers):
-                deadline = time.monotonic() + 1.0
-                while True:
-                    with self._rx_lock:
-                        if self._rx_seq > last_seq:
-                            rx1, rx2 = self._rx_latest
-                            last_seq = self._rx_seq
+                with self._rx_cond:
+                    while self._rx_seq <= last_seq:
+                        if not self._rx_cond.wait(timeout=1.0):
                             break
-                    if time.monotonic() > deadline:
-                        rx1, rx2 = None, None
-                        break
-                    time.sleep(0.0002)
+                    if self._rx_seq > last_seq:
+                        rx1_bufs.append(self._rx_latest[0])
+                        rx2_bufs.append(self._rx_latest[1])
+                        last_seq = self._rx_seq
 
-                if rx1 is None or rx2 is None:
-                    continue
-
-                i1 = rx1[0::2].astype(np.float64) / 2047.0
-                q1 = rx1[1::2].astype(np.float64) / 2047.0
-                sig_accum += np.mean((i1 + 1j * q1) * self._ref_tone)
-
-                i2 = rx2[0::2].astype(np.float64) / 2047.0
-                q2 = rx2[1::2].astype(np.float64) / 2047.0
-                ref_accum += np.mean((i2 + 1j * q2) * self._ref_tone)
-
-                captured += 1
-
-            if captured < num_buffers:
+            captured = len(rx1_bufs)
+            if captured > 0:
+                sig_arr = np.array(rx1_bufs, dtype=np.float64)
+                ref_arr = np.array(rx2_bufs, dtype=np.float64)
+                sig_cplx = (sig_arr[:, 0::2] + 1j * sig_arr[:, 1::2]) * self._ref_tone_scaled
+                ref_cplx = (ref_arr[:, 0::2] + 1j * ref_arr[:, 1::2]) * self._ref_tone_scaled
+                h_signal[i] = sig_cplx.mean()
+                h_reference[i] = ref_cplx.mean()
+            else:
                 dropped_steps += 1
-
-            h_signal[i] = sig_accum / max(captured, 1)
-            h_reference[i] = ref_accum / max(captured, 1)
-
-        # Normalize out per-step digital amplitude variations
-        if tx1_amplitudes is not None:
-            for i in range(num_steps):
-                if tx1_amplitudes[i] > 0.001:
-                    h_signal[i] /= tx1_amplitudes[i]
-        if tx2_amplitudes is not None:
-            for i in range(num_steps):
-                if tx2_amplitudes[i] > 0.001:
-                    h_reference[i] /= tx2_amplitudes[i]
 
         ref_mag = np.abs(h_reference)
         valid = ref_mag > 1e-10
@@ -777,6 +733,13 @@ class SFCWEngine:
         h_cal_real = h_cal.real.tolist()
         h_cal_imag = h_cal.imag.tolist()
 
+        bscan_flag = self._capture_bscan
+        if bscan_flag:
+            self._capture_bscan = False
+        bscan_bg_flag = self._capture_bscan_bg
+        if bscan_bg_flag:
+            self._capture_bscan_bg = False
+
         return {
             'type': 'range_profile',
             'distances': distances.tolist(),
@@ -789,6 +752,8 @@ class SFCWEngine:
             'step_size': step,
             'range_offset': self.range_offset,
             'timestamp': time.time(),
+            'bscan_capture': bscan_flag,
+            'bscan_bg_capture': bscan_bg_flag,
             'phase_coherence': {
                 'phase_std_rad': phase_std,
                 'phase_std_deg': float(np.degrees(phase_std)),

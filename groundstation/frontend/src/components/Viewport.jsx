@@ -1,5 +1,6 @@
+import { useState } from 'react';
 import { cn } from '@/lib/utils';
-import { Activity, Eye, Radio, Radar, ScanLine, AlignVerticalSpaceBetween, Grid3x3, Zap } from 'lucide-react';
+import { Activity, Eye, Radio, Radar, ScanLine, AlignVerticalSpaceBetween, Grid3x3, Map, Zap } from 'lucide-react';
 import ImuDisplay from './ImuDisplay';
 import OptiFlowDisplay from './OptiFlowDisplay';
 import WaveformDisplay from './WaveformDisplay';
@@ -8,6 +9,7 @@ import FftDisplay from './FftDisplay';
 import SfcwDisplay from './SfcwDisplay';
 import BscanDisplay from './BscanDisplay';
 import SarDisplay from './SarDisplay';
+import MapDisplay from './MapDisplay';
 
 export default function Viewport({
   activePanel,
@@ -33,10 +35,21 @@ export default function Viewport({
   bscanCapturing,
   bscanScaleMode,
   bscanDisplayMode,
-  alignedDisplayData,
   sarResult,
   sarProgress,
+  sarScaleMode,
+  sarDynRange,
+  mapBscanData,
+  mapGateStart,
+  mapGateEnd,
+  mapDynRange,
+  mapMetric,
+  mapStepSize,
+  mapFocusEnabled,
+  mapFocusAperture,
 }) {
+  const [bscanLiveRange, setBscanLiveRange] = useState({ min: 0, max: 0.3 });
+
   if (!activePanel) {
     return (
       <div className="flex-1 flex flex-col items-center justify-center bg-black select-none">
@@ -177,9 +190,30 @@ export default function Viewport({
     const targetScanShifts = bscanData.map(() => 0);
     const targetBgShift = 0;
     const displayData = (isAligned && bscanAlignedSvdData) ? bscanAlignedSvdData : bscanData;
+    const showLiveSweep = activePanel === 'bscan' && (sfcwRunning || sfcwResult);
 
     return (
       <div className="flex-1 flex flex-col h-screen overflow-hidden bg-black">
+        {/* Live sweep range profile (top) — shown during B-scan session */}
+        {showLiveSweep && (
+          <div className="relative flex flex-col border-b border-white/5" style={{ flex: '0 0 35%' }}>
+            <PaneHeader icon={Radar} label="Live Sweep" active={sfcwRunning} color="orange" />
+            <div className="flex-1 min-h-0 relative overflow-hidden">
+              <SfcwDisplay
+                sfcwResult={sfcwResult}
+                sfcwProgress={sfcwProgress}
+                sfcwRunning={sfcwRunning}
+                rangeScale={bscanLiveRange}
+                hideWaterfall
+                defaultScaleMode="linear"
+                onRangeScaleToggle={() => setBscanLiveRange(prev =>
+                  prev.max <= 0.5 ? { min: 0, max: 3 } : { min: 0, max: 0.3 }
+                )}
+              />
+            </div>
+          </div>
+        )}
+        {/* B-scan image (bottom) */}
         <div className="relative flex flex-col min-h-0" style={{ flex: '1 1 0%' }}>
           <PaneHeader icon={icon} label={label} active={bscanData.length > 0} color="cyan" />
           <div className="flex-1 min-h-0 relative overflow-hidden">
@@ -199,7 +233,7 @@ export default function Viewport({
               targetShifts={targetScanShifts}
               targetBgShift={targetBgShift}
             />
-            {bscanData.length === 0 && (
+            {bscanData.length === 0 && !showLiveSweep && (
               <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
                 <span className="text-xs text-[#333333] uppercase tracking-widest font-medium">No scan data</span>
               </div>
@@ -224,10 +258,44 @@ export default function Viewport({
             <SarDisplay
               sarResult={sarResult}
               sarProgress={sarProgress}
+              scaleMode={sarScaleMode}
+              dynRange={sarDynRange}
             />
             {!sarResult && sarProgress === null && (
               <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
                 <span className="text-xs text-[#333333] uppercase tracking-widest font-medium">No SAR image — need ≥2 B-scan positions</span>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (activePanel === 'map') {
+    return (
+      <div className="flex-1 flex flex-col h-screen overflow-hidden bg-black">
+        <div className="relative flex flex-col min-h-0" style={{ flex: '1 1 0%' }}>
+          <PaneHeader icon={Map} label="2D Map" active={mapBscanData && mapBscanData.length > 0} color="green" />
+          <div className="flex-1 min-h-0 relative overflow-hidden">
+            {mapBscanData && mapBscanData.length > 0 && (
+              <div className="absolute inset-0 pointer-events-none">
+                <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[60%] h-[60%] bg-[#4aff8a]/4 blur-[80px] rounded-full" />
+              </div>
+            )}
+            <MapDisplay
+              bscanData={mapBscanData}
+              gateStart={mapGateStart}
+              gateEnd={mapGateEnd}
+              dynRange={mapDynRange}
+              metric={mapMetric}
+              stepSize={mapStepSize}
+              focusEnabled={mapFocusEnabled}
+              focusAperture={mapFocusAperture}
+            />
+            {(!mapBscanData || mapBscanData.length === 0) && (
+              <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                <span className="text-xs text-[#333333] uppercase tracking-widest font-medium">No B-scan data — capture or load a scan</span>
               </div>
             )}
           </div>

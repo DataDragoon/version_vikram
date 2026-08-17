@@ -35,6 +35,8 @@ class SDRServer:
             sys.exit(1)
 
         print(f"[sdr] Device: {self.driver.serial}")
+        self.sfcw._generate_quick_tune_profiles()
+        print(f"[sdr] SFCW quick_tune profiles ready")
         print(f"[sdr] Starting WebSocket server on port {PORT}")
         self._broadcast_task = asyncio.create_task(self._broadcast_loop())
         self._sfcw_broadcast_task = asyncio.create_task(self._sfcw_broadcast_loop())
@@ -146,6 +148,12 @@ class SDRServer:
 
             elif action == 'sfcw_capture_bg':
                 self.sfcw.capture_background()
+
+            elif action == 'bscan_capture':
+                self.sfcw.capture_bscan()
+
+            elif action == 'bscan_bg_capture':
+                self.sfcw.capture_bscan_bg()
 
             elif action == 'sfcw_clear_bg':
                 self.sfcw.clear_background()
@@ -268,6 +276,10 @@ class SDRServer:
                 }
                 if 'phase_coherence' in data:
                     result_msg['phase_coherence'] = data['phase_coherence']
+                if data.get('bscan_capture'):
+                    result_msg['bscan_capture'] = True
+                if data.get('bscan_bg_capture'):
+                    result_msg['bscan_bg_capture'] = True
                 msg = json.dumps(result_msg)
             else:
                 continue
