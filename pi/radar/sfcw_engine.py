@@ -441,13 +441,14 @@ class SFCWEngine:
 
         params_key = (start, stop, step)
         if self._qt_params == params_key and self._qt_profiles_rx is not None:
-            print(f"[TIMING] Quick_tune profiles already cached (reusing)")
+            print(f"  → Quick_tune profiles already cached, reusing {len(self._qt_profiles_rx)} profiles")
             return
 
         t_start = time.perf_counter()
-        print(f"[TIMING] Generating quick_tune profiles...")
-
         num_steps = int((stop - start) / step) + 1
+        print(f"  → Generating quick_tune profiles ({num_steps} frequencies: {start/1e9:.1f}-{stop/1e9:.1f} GHz)")
+        print(f"     Purpose: Pre-cache PLL settings to avoid USB round-trips during sweep")
+
         freqs = np.linspace(start, stop, num_steps).astype(np.int64)
         dev_ptr = self.driver.device.dev[0]
 
@@ -456,8 +457,10 @@ class SFCWEngine:
         for i, f in enumerate(freqs):
             t0 = time.perf_counter()
             f_int = int(f)
+            # Full VCO calibration at each frequency
             libbladeRF.bladerf_set_frequency(dev_ptr, bladerf.CHANNEL_RX(0), f_int)
             libbladeRF.bladerf_set_frequency(dev_ptr, bladerf.CHANNEL_TX(0), f_int)
+            # Capture the tuning state
             qr = ffi.new('struct bladerf_quick_tune *')
             qt_val = ffi.new('struct bladerf_quick_tune *')
             libbladeRF.bladerf_get_quick_tune(dev_ptr, bladerf.CHANNEL_RX(0), qr)
@@ -467,75 +470,93 @@ class SFCWEngine:
 
             if i < 3 or i >= num_steps - 2:
                 t_step = time.perf_counter() - t0
-                print(f"  Profile {i}/{num_steps-1} @ {f_int/1e6:.0f} MHz: {t_step*1e6:7.1f} µs")
+                print(f"     [{i:3d}] {f_int/1e6:4.0f} MHz: VCO cal + capture state ({t_step*1e6:6.1f} µs)")
 
         self._qt_profiles_rx = qt_rx
         self._qt_profiles_tx = qt_tx
         self._qt_params = params_key
 
         t_total = time.perf_counter() - t_start
-        print(f"[TIMING] Generated {num_steps} quick_tune profiles in {t_total*1e6:10.1f} µs ({t_total*1000:6.2f} ms)")
+        print(f"  ✓ Generated {num_steps} profiles in {t_total*1e6:10.1f} µs ({t_total*1000:6.2f} ms)\n")
 
     def _configure_hardware(self):
         t_start = time.perf_counter()
-        print(f"\n[TIMING] Configuring hardware...")
+        print(f"\n[PROCESS] Configuring hardware...")
 
         t0 = time.perf_counter()
+        print(f"  → Setting TX/RX gains (TX1={self.tx1_gain}, RX1={self.rx1_gain})")
         self.driver.tx_gain = self.tx1_gain
         self.driver.rx_gain = self.rx1_gain
         self.driver.tx2_gain = self.tx2_gain
         self.driver.rx2_gain = self.rx2_gain
+        print(f"  → Setting sample rate to 10 MHz (bandwidth 8 MHz)")
         self.driver.sample_rate = 10_000_000
         self.driver.bandwidth = 8_000_000
+        print(f"  → Generating CW waveform (100 kHz offset, 0.9 amplitude)")
         self.driver.set_waveform('cw', offset=100_000, amplitude=0.9)
         t_basic_config = time.perf_counter() - t0
+        print(f"     Time: {t_basic_config*1e6:7.1f} µs")
 
         if self._use_quick_tune:
             self._generate_quick_tune_profiles()
 
         t0 = time.perf_counter()
+        print(f"  → Configuring dual-channel mode (TX1+TX2, RX1+RX2)")
         self.driver._configure_channels_dual()
         t_channels = time.perf_counter() - t0
+        print(f"     Time: {t_channels*1e6:7.1f} µs")
 
         t0 = time.perf_counter()
+        print(f"  → Setting FPGA tuning mode (hardware-timed frequency changes)")
         self.driver.set_tuning_mode_fpga()
         t_tuning_mode = time.perf_counter() - t0
         self._fpga_tuning = True
+        print(f"     Time: {t_tuning_mode*1e6:7.1f} µs")
 
         t_total = time.perf_counter() - t_start
-        print(f"[TIMING] Hardware config: {t_basic_config*1e6:7.1f} µs (basic)")
-        print(f"[TIMING] Channel config:  {t_channels*1e6:7.1f} µs (dual-channel)")
-        print(f"[TIMING] Tuning mode:     {t_tuning_mode*1e6:7.1f} µs (FPGA)")
-        print(f"[TIMING] Config total:    {t_total*1e6:7.1f} µs ({t_total*1000:.2f} ms)\n")
+        print(f"  ✓ Hardware configured in {t_total*1e6:7.1f} µs ({t_total*1000:.2f} ms)\n")
 
     def _start_tx_rx(self):
         t_start = time.perf_counter()
-        print(f"[TIMING] Starting TX/RX streams...")
+        print(f"[PROCESS] Starting TX/RX streams...")
 
         t0 = time.perf_counter()
+        print(f"  → Initializing RX condition variable for buffer synchronization")
         self._rx_cond = threading.Condition()
         self._rx_latest = None
         self._rx_seq = 0
         n = 4096
+        print(f"  → Computing reference tone (100 kHz offset, 4096 samples)")
+        print(f"     Purpose: Demodulate received IQ data to baseband")
         t = np.arange(n, dtype=np.float64) / self.driver.sample_rate
         self._ref_tone = np.exp(-1j * 2 * np.pi * self.driver.cw_offset * t)
         self._ref_tone_scaled = self._ref_tone / 2047.0
         t_prep = time.perf_counter() - t0
+        print(f"     Time: {t_prep*1e6:8.1f} µs")
 
         t0 = time.perf_counter()
+        print(f"  → Starting TX dual-channel stream (TX1=antenna, TX2=reference cable)")
         self.driver.start_tx_dual()
         t_start_tx = time.perf_counter() - t0
+        print(f"     Time: {t_start_tx*1e6:8.1f} µs")
 
         t0 = time.perf_counter()
+        print(f"  → Starting RX dual-channel stream (RX1=antenna, RX2=reference cable)")
+        print(f"     Buffer size: {n} samples per channel")
         self.driver.start_rx_dual(self._rx_capture, num_samples=n)
         t_start_rx = time.perf_counter() - t0
+        print(f"     Time: {t_start_rx*1e6:8.1f} µs")
 
         t0 = time.perf_counter()
+        print(f"  → Waiting for streams to stabilize (50ms)")
         time.sleep(0.05)
         t_settle = time.perf_counter() - t0
+        print(f"     Time: {t_settle*1e6:8.1f} µs")
 
         # Apply gains AFTER modules are enabled (enable_module resets gain state)
         t0 = time.perf_counter()
+        print(f"  → Applying gains (must be done AFTER module enable)")
+        print(f"     RX1={self.rx1_gain}dB, RX2={self.rx2_gain}dB, TX1={self.tx1_gain}dB, TX2={self.tx2_gain}dB")
         dev_ptr = self.driver.device.dev[0]
         libbladeRF.bladerf_set_gain_mode(dev_ptr, bladerf.CHANNEL_RX(0), libbladeRF.BLADERF_GAIN_MGC)
         libbladeRF.bladerf_set_gain_mode(dev_ptr, bladerf.CHANNEL_RX(1), libbladeRF.BLADERF_GAIN_MGC)
@@ -544,14 +565,10 @@ class SFCWEngine:
         libbladeRF.bladerf_set_gain(dev_ptr, bladerf.CHANNEL_TX(0), int(self.tx1_gain))
         libbladeRF.bladerf_set_gain(dev_ptr, bladerf.CHANNEL_TX(1), int(self.tx2_gain))
         t_gains = time.perf_counter() - t0
+        print(f"     Time: {t_gains*1e6:8.1f} µs")
 
         t_total = time.perf_counter() - t_start
-        print(f"[TIMING] Ref tone prep:  {t_prep*1e6:8.1f} µs")
-        print(f"[TIMING] Start TX:       {t_start_tx*1e6:8.1f} µs")
-        print(f"[TIMING] Start RX:       {t_start_rx*1e6:8.1f} µs")
-        print(f"[TIMING] Stream settle:  {t_settle*1e6:8.1f} µs (50ms sleep)")
-        print(f"[TIMING] Apply gains:    {t_gains*1e6:8.1f} µs")
-        print(f"[TIMING] Start total:    {t_total*1e6:8.1f} µs ({t_total*1000:.2f} ms)\n")
+        print(f"  ✓ TX/RX streams active in {t_total*1e6:8.1f} µs ({t_total*1000:.2f} ms)\n")
 
     def _apply_gains(self):
         dev_ptr = self.driver.device.dev[0]
@@ -578,6 +595,10 @@ class SFCWEngine:
     def _perform_sweep(self):
         t_sweep_start = time.perf_counter()
 
+        print(f"\n{'='*75}")
+        print(f"[SFCW SWEEP] Starting stepped-frequency sweep")
+        print(f"{'='*75}")
+
         with self._lock:
             start = self.start_freq
             stop = self.stop_freq
@@ -598,6 +619,15 @@ class SFCWEngine:
         use_qt = (self._use_quick_tune and self._qt_profiles_rx is not None
                   and len(self._qt_profiles_rx) == num_steps)
         settle_count = 10 if use_qt else 2
+
+        print(f"\nSWEEP CONFIGURATION:")
+        print(f"  Frequency range: {start/1e9:.1f} - {stop/1e9:.1f} GHz")
+        print(f"  Step size: {step/1e6:.1f} MHz")
+        print(f"  Number of steps: {num_steps}")
+        print(f"  Retune method: {'Quick_tune (pre-cached)' if use_qt else 'Set_frequency (full VCO)'}")
+        print(f"  Settle buffers: {settle_count} @ {self.driver.sample_rate/1e6:.0f} MHz sample rate")
+        print(f"  Buffers per step: {num_buffers}")
+        print(f"\nSTARTING SWEEP...\n")
 
         dropped_steps = 0
 
@@ -679,12 +709,28 @@ class SFCWEngine:
             all_process_times.append(t_process * 1e6)
 
             if do_log:
-                print(f"\n[TIMING] Step {i}/{num_steps-1} @ {f/1e6:.0f} MHz:")
-                print(f"  Retune:     {t_retune*1e6:8.1f} µs  ({'quick_tune' if use_qt else 'set_freq'})")
-                print(f"  Settle:     {t_settle*1e6:8.1f} µs  (wait for {settle_count} buffers)")
-                print(f"  Capture:    {t_capture*1e6:8.1f} µs  ({captured} buffers)")
-                print(f"  Process:    {t_process*1e6:8.1f} µs  (demod + correlation)")
-                print(f"  STEP TOTAL: {t_step_total*1e6:8.1f} µs")
+                print(f"\n[STEP {i}/{num_steps-1}] Frequency: {f/1e6:.0f} MHz ({f/1e9:.2f} GHz)")
+                print(f"  1. Retune TX/RX PLLs to {f/1e6:.0f} MHz")
+                print(f"     → Method: {'Quick_tune (pre-cached)' if use_qt else 'Set_frequency (full VCO cal)'}")
+                print(f"     → Time: {t_retune*1e6:8.1f} µs")
+                print(f"")
+                print(f"  2. Wait for PLL to stabilize")
+                print(f"     → Waiting for {settle_count} new RX buffers to arrive")
+                print(f"     → Purpose: Discard buffers captured during frequency change")
+                print(f"     → Time: {t_settle*1e6:8.1f} µs")
+                print(f"")
+                print(f"  3. Capture IQ samples")
+                print(f"     → Captured {captured} buffer(s) of 4096 samples each")
+                print(f"     → RX1: Antenna signal, RX2: Reference cable (for phase calibration)")
+                print(f"     → Time: {t_capture*1e6:8.1f} µs")
+                print(f"")
+                print(f"  4. Process captured data")
+                print(f"     → Convert int16 → float64 → complex")
+                print(f"     → Multiply by reference tone (demodulate to baseband)")
+                print(f"     → Compute mean (correlation)")
+                print(f"     → Time: {t_process*1e6:8.1f} µs")
+                print(f"")
+                print(f"  ✓ Step completed in {t_step_total*1e6:8.1f} µs")
 
             if self._callback and i % 10 == 0:
                 self._callback({
@@ -727,32 +773,50 @@ class SFCWEngine:
         t_sweep_total = time.perf_counter() - t_sweep_start
 
         if enable_timing:
-            print(f"\n{'='*70}")
-            print(f"[TIMING SUMMARY] Sweep complete")
-            print(f"{'='*70}")
+            print(f"\n{'='*75}")
+            print(f"[SWEEP SUMMARY] All {num_steps} frequency steps completed")
+            print(f"{'='*75}")
             avg_step = np.mean(all_step_times)
             avg_retune = np.mean(all_retune_times)
             avg_settle = np.mean(all_settle_times)
             avg_capture = np.mean(all_capture_times)
             avg_process = np.mean(all_process_times)
 
-            print(f"  Per-step averages ({num_steps} steps):")
-            print(f"    Retune:      {avg_retune:8.1f} µs  ({avg_retune/avg_step*100:4.1f}%)")
-            print(f"    Settle:      {avg_settle:8.1f} µs  ({avg_settle/avg_step*100:4.1f}%)")
-            print(f"    Capture:     {avg_capture:8.1f} µs  ({avg_capture/avg_step*100:4.1f}%)")
-            print(f"    Process:     {avg_process:8.1f} µs  ({avg_process/avg_step*100:4.1f}%)")
-            print(f"    Step total:  {avg_step:8.1f} µs")
+            print(f"\nPER-STEP BREAKDOWN (averaged over {num_steps} steps):")
             print(f"")
-            print(f"  Post-processing:")
-            print(f"    Phase calib: {t_phase_cal*1e6:8.1f} µs")
-            print(f"    Background:  {t_bg_sub*1e6:8.1f} µs")
-            print(f"    Post total:  {t_post_total*1e6:8.1f} µs")
+            print(f"  1. Retune: {avg_retune:8.1f} µs  ({avg_retune/avg_step*100:4.1f}%)")
+            print(f"     → Change TX/RX frequency using {'quick_tune' if use_qt else 'set_frequency'}")
             print(f"")
-            print(f"  Final processing (IFFT, etc.):")
-            print(f"    Time:        {t_final_process*1e6:8.1f} µs")
+            print(f"  2. Settle: {avg_settle:8.1f} µs  ({avg_settle/avg_step*100:4.1f}%)")
+            print(f"     → Wait for PLL stabilization ({settle_count} buffers @ {self.driver.sample_rate/1e6:.0f} MHz)")
             print(f"")
-            print(f"  TOTAL SWEEP TIME: {t_sweep_total*1e6:10.1f} µs  ({t_sweep_total*1000:6.2f} ms)")
-            print(f"{'='*70}\n")
+            print(f"  3. Capture: {avg_capture:8.1f} µs  ({avg_capture/avg_step*100:4.1f}%)")
+            print(f"     → Receive {num_buffers} buffer(s) of IQ data from RX1+RX2")
+            print(f"")
+            print(f"  4. Process: {avg_process:8.1f} µs  ({avg_process/avg_step*100:4.1f}%)")
+            print(f"     → Convert, demodulate, and correlate IQ samples")
+            print(f"")
+            print(f"  Total per step: {avg_step:8.1f} µs")
+            print(f"")
+            print(f"{'-'*75}")
+            print(f"\nPOST-PROCESSING (after all steps):")
+            print(f"")
+            print(f"  Phase calibration: {t_phase_cal*1e6:8.1f} µs")
+            print(f"  → Divide h_signal by h_reference to cancel TX/RX phase offsets")
+            print(f"")
+            print(f"  Background handling: {t_bg_sub*1e6:8.1f} µs")
+            print(f"  → Copy h_cal for background subtraction")
+            print(f"")
+            print(f"{'-'*75}")
+            print(f"\nFINAL PROCESSING:")
+            print(f"")
+            print(f"  IFFT + range conversion: {t_final_process*1e6:8.1f} µs")
+            print(f"  → Frequency domain → time domain (range profile)")
+            print(f"  → Apply windowing, compute dB magnitude")
+            print(f"")
+            print(f"{'='*75}")
+            print(f"TOTAL SWEEP TIME: {t_sweep_total*1e6:10.1f} µs  ({t_sweep_total*1000:6.2f} ms)")
+            print(f"{'='*75}\n")
 
         return result
 
