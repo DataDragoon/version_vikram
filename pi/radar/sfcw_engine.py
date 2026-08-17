@@ -441,7 +441,11 @@ class SFCWEngine:
 
         params_key = (start, stop, step)
         if self._qt_params == params_key and self._qt_profiles_rx is not None:
+            print(f"[TIMING] Quick_tune profiles already cached (reusing)")
             return
+
+        t_start = time.perf_counter()
+        print(f"[TIMING] Generating quick_tune profiles...")
 
         num_steps = int((stop - start) / step) + 1
         freqs = np.linspace(start, stop, num_steps).astype(np.int64)
@@ -449,7 +453,8 @@ class SFCWEngine:
 
         qt_rx = []
         qt_tx = []
-        for f in freqs:
+        for i, f in enumerate(freqs):
+            t0 = time.perf_counter()
             f_int = int(f)
             libbladeRF.bladerf_set_frequency(dev_ptr, bladerf.CHANNEL_RX(0), f_int)
             libbladeRF.bladerf_set_frequency(dev_ptr, bladerf.CHANNEL_TX(0), f_int)
@@ -460,12 +465,22 @@ class SFCWEngine:
             qt_rx.append(qr)
             qt_tx.append(qt_val)
 
+            if i < 3 or i >= num_steps - 2:
+                t_step = time.perf_counter() - t0
+                print(f"  Profile {i}/{num_steps-1} @ {f_int/1e6:.0f} MHz: {t_step*1e6:7.1f} µs")
+
         self._qt_profiles_rx = qt_rx
         self._qt_profiles_tx = qt_tx
         self._qt_params = params_key
-        print(f"[sfcw] Generated {num_steps} quick_tune profiles")
+
+        t_total = time.perf_counter() - t_start
+        print(f"[TIMING] Generated {num_steps} quick_tune profiles in {t_total*1e6:10.1f} µs ({t_total*1000:6.2f} ms)")
 
     def _configure_hardware(self):
+        t_start = time.perf_counter()
+        print(f"\n[TIMING] Configuring hardware...")
+
+        t0 = time.perf_counter()
         self.driver.tx_gain = self.tx1_gain
         self.driver.rx_gain = self.rx1_gain
         self.driver.tx2_gain = self.tx2_gain
@@ -473,13 +488,31 @@ class SFCWEngine:
         self.driver.sample_rate = 10_000_000
         self.driver.bandwidth = 8_000_000
         self.driver.set_waveform('cw', offset=100_000, amplitude=0.9)
+        t_basic_config = time.perf_counter() - t0
+
         if self._use_quick_tune:
             self._generate_quick_tune_profiles()
+
+        t0 = time.perf_counter()
         self.driver._configure_channels_dual()
+        t_channels = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
         self.driver.set_tuning_mode_fpga()
+        t_tuning_mode = time.perf_counter() - t0
         self._fpga_tuning = True
 
+        t_total = time.perf_counter() - t_start
+        print(f"[TIMING] Hardware config: {t_basic_config*1e6:7.1f} µs (basic)")
+        print(f"[TIMING] Channel config:  {t_channels*1e6:7.1f} µs (dual-channel)")
+        print(f"[TIMING] Tuning mode:     {t_tuning_mode*1e6:7.1f} µs (FPGA)")
+        print(f"[TIMING] Config total:    {t_total*1e6:7.1f} µs ({t_total*1000:.2f} ms)\n")
+
     def _start_tx_rx(self):
+        t_start = time.perf_counter()
+        print(f"[TIMING] Starting TX/RX streams...")
+
+        t0 = time.perf_counter()
         self._rx_cond = threading.Condition()
         self._rx_latest = None
         self._rx_seq = 0
@@ -487,11 +520,22 @@ class SFCWEngine:
         t = np.arange(n, dtype=np.float64) / self.driver.sample_rate
         self._ref_tone = np.exp(-1j * 2 * np.pi * self.driver.cw_offset * t)
         self._ref_tone_scaled = self._ref_tone / 2047.0
+        t_prep = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
         self.driver.start_tx_dual()
+        t_start_tx = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
         self.driver.start_rx_dual(self._rx_capture, num_samples=n)
+        t_start_rx = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
         time.sleep(0.05)
+        t_settle = time.perf_counter() - t0
 
         # Apply gains AFTER modules are enabled (enable_module resets gain state)
+        t0 = time.perf_counter()
         dev_ptr = self.driver.device.dev[0]
         libbladeRF.bladerf_set_gain_mode(dev_ptr, bladerf.CHANNEL_RX(0), libbladeRF.BLADERF_GAIN_MGC)
         libbladeRF.bladerf_set_gain_mode(dev_ptr, bladerf.CHANNEL_RX(1), libbladeRF.BLADERF_GAIN_MGC)
@@ -499,6 +543,15 @@ class SFCWEngine:
         libbladeRF.bladerf_set_gain(dev_ptr, bladerf.CHANNEL_RX(1), int(self.rx2_gain))
         libbladeRF.bladerf_set_gain(dev_ptr, bladerf.CHANNEL_TX(0), int(self.tx1_gain))
         libbladeRF.bladerf_set_gain(dev_ptr, bladerf.CHANNEL_TX(1), int(self.tx2_gain))
+        t_gains = time.perf_counter() - t0
+
+        t_total = time.perf_counter() - t_start
+        print(f"[TIMING] Ref tone prep:  {t_prep*1e6:8.1f} µs")
+        print(f"[TIMING] Start TX:       {t_start_tx*1e6:8.1f} µs")
+        print(f"[TIMING] Start RX:       {t_start_rx*1e6:8.1f} µs")
+        print(f"[TIMING] Stream settle:  {t_settle*1e6:8.1f} µs (50ms sleep)")
+        print(f"[TIMING] Apply gains:    {t_gains*1e6:8.1f} µs")
+        print(f"[TIMING] Start total:    {t_total*1e6:8.1f} µs ({t_total*1000:.2f} ms)\n")
 
     def _apply_gains(self):
         dev_ptr = self.driver.device.dev[0]
@@ -523,6 +576,8 @@ class SFCWEngine:
             self._rx_cond.notify_all()
 
     def _perform_sweep(self):
+        t_sweep_start = time.perf_counter()
+
         with self._lock:
             start = self.start_freq
             stop = self.stop_freq
@@ -546,10 +601,24 @@ class SFCWEngine:
 
         dropped_steps = 0
 
+        # Timing instrumentation
+        enable_timing = True
+        timing_steps = set(range(5)) | {num_steps - 2, num_steps - 1}
+        all_step_times = []
+        all_retune_times = []
+        all_settle_times = []
+        all_capture_times = []
+        all_process_times = []
+
         for i in range(num_steps):
+            t_step_start = time.perf_counter()
+            do_log = enable_timing and i in timing_steps
+
             if self._stop_event.is_set():
                 return None
 
+            # === TIMING: Frequency retune ===
+            t0 = time.perf_counter()
             f = int(freqs[i])
             if use_qt:
                 libbladeRF.bladerf_schedule_retune(dev_ptr, rx_ch, 0, f, self._qt_profiles_rx[i])
@@ -557,15 +626,19 @@ class SFCWEngine:
             else:
                 libbladeRF.bladerf_set_frequency(dev_ptr, tx_ch, f)
                 libbladeRF.bladerf_set_frequency(dev_ptr, rx_ch, f)
+            t_retune = time.perf_counter() - t0
 
-            # Wait for PLL settle after retune
+            # === TIMING: Wait for PLL settle ===
+            t0 = time.perf_counter()
             with self._rx_cond:
                 target_seq = self._rx_seq + settle_count
                 while self._rx_seq < target_seq:
                     if not self._rx_cond.wait(timeout=1.0):
                         break
+            t_settle = time.perf_counter() - t0
 
-            # Capture num_buffers fresh samples, each waiting for a new seq tick
+            # === TIMING: Capture buffers ===
+            t0 = time.perf_counter()
             rx1_bufs = []
             rx2_bufs = []
             with self._rx_cond:
@@ -580,7 +653,10 @@ class SFCWEngine:
                         rx1_bufs.append(self._rx_latest[0])
                         rx2_bufs.append(self._rx_latest[1])
                         last_seq = self._rx_seq
+            t_capture = time.perf_counter() - t0
 
+            # === TIMING: Process buffers ===
+            t0 = time.perf_counter()
             captured = len(rx1_bufs)
             if captured > 0:
                 # Batch deinterleave + complex conversion + ref_tone correlation
@@ -592,6 +668,23 @@ class SFCWEngine:
                 h_reference[i] = ref_cplx.mean()
             else:
                 dropped_steps += 1
+            t_process = time.perf_counter() - t0
+
+            # === TIMING: Record and log ===
+            t_step_total = time.perf_counter() - t_step_start
+            all_step_times.append(t_step_total * 1e6)  # microseconds
+            all_retune_times.append(t_retune * 1e6)
+            all_settle_times.append(t_settle * 1e6)
+            all_capture_times.append(t_capture * 1e6)
+            all_process_times.append(t_process * 1e6)
+
+            if do_log:
+                print(f"\n[TIMING] Step {i}/{num_steps-1} @ {f/1e6:.0f} MHz:")
+                print(f"  Retune:     {t_retune*1e6:8.1f} µs  ({'quick_tune' if use_qt else 'set_freq'})")
+                print(f"  Settle:     {t_settle*1e6:8.1f} µs  (wait for {settle_count} buffers)")
+                print(f"  Capture:    {t_capture*1e6:8.1f} µs  ({captured} buffers)")
+                print(f"  Process:    {t_process*1e6:8.1f} µs  (demod + correlation)")
+                print(f"  STEP TOTAL: {t_step_total*1e6:8.1f} µs")
 
             if self._callback and i % 10 == 0:
                 self._callback({
@@ -604,20 +697,64 @@ class SFCWEngine:
         if dropped_steps > 0:
             print(f"[sfcw] WARNING: {dropped_steps}/{num_steps} steps had incomplete captures")
 
+        # === TIMING: Post-processing ===
+        t_post_start = time.perf_counter()
+
         # Phase-reference division: cancels TX and RX PLL phase offsets
+        t0 = time.perf_counter()
         ref_mag = np.abs(h_reference)
         valid = ref_mag > 1e-10
         h_cal = np.zeros(num_steps, dtype=np.complex128)
         h_cal[valid] = h_signal[valid] / h_reference[valid]
+        t_phase_cal = time.perf_counter() - t0
 
         # Background subtraction: removes TX->RX coupling and static clutter
+        t0 = time.perf_counter()
         if self._capture_background:
             self._background = h_cal.copy()
             self._capture_background = False
-
         self._last_h_cal = h_cal.copy()
+        t_bg_sub = time.perf_counter() - t0
 
-        return self._process_h_cal(h_cal)
+        t_post_total = time.perf_counter() - t_post_start
+
+        # === TIMING: Final processing (IFFT, etc.) ===
+        t_final_start = time.perf_counter()
+        result = self._process_h_cal(h_cal)
+        t_final_process = time.perf_counter() - t_final_start
+
+        # === TIMING: Print summary ===
+        t_sweep_total = time.perf_counter() - t_sweep_start
+
+        if enable_timing:
+            print(f"\n{'='*70}")
+            print(f"[TIMING SUMMARY] Sweep complete")
+            print(f"{'='*70}")
+            avg_step = np.mean(all_step_times)
+            avg_retune = np.mean(all_retune_times)
+            avg_settle = np.mean(all_settle_times)
+            avg_capture = np.mean(all_capture_times)
+            avg_process = np.mean(all_process_times)
+
+            print(f"  Per-step averages ({num_steps} steps):")
+            print(f"    Retune:      {avg_retune:8.1f} µs  ({avg_retune/avg_step*100:4.1f}%)")
+            print(f"    Settle:      {avg_settle:8.1f} µs  ({avg_settle/avg_step*100:4.1f}%)")
+            print(f"    Capture:     {avg_capture:8.1f} µs  ({avg_capture/avg_step*100:4.1f}%)")
+            print(f"    Process:     {avg_process:8.1f} µs  ({avg_process/avg_step*100:4.1f}%)")
+            print(f"    Step total:  {avg_step:8.1f} µs")
+            print(f"")
+            print(f"  Post-processing:")
+            print(f"    Phase calib: {t_phase_cal*1e6:8.1f} µs")
+            print(f"    Background:  {t_bg_sub*1e6:8.1f} µs")
+            print(f"    Post total:  {t_post_total*1e6:8.1f} µs")
+            print(f"")
+            print(f"  Final processing (IFFT, etc.):")
+            print(f"    Time:        {t_final_process*1e6:8.1f} µs")
+            print(f"")
+            print(f"  TOTAL SWEEP TIME: {t_sweep_total*1e6:10.1f} µs  ({t_sweep_total*1000:6.2f} ms)")
+            print(f"{'='*70}\n")
+
+        return result
 
     def _perform_sweep_raw(self):
         """Like _perform_sweep but returns raw h_cal array for averaging."""
